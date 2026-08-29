@@ -4,6 +4,9 @@
 #include <new>
 #include <thread>
 #include <future>
+#include <sddl.h>
+
+#pragma comment(lib,"Advapi32.lib")
 
 namespace {
 uc::Runtime* runtime=nullptr;
@@ -13,6 +16,40 @@ std::string bootstrapError;
 uc::Json pendingPlan;
 std::string pendingRequestId;
 std::mutex pendingMutex;
+
+struct PipeSecurity {
+    SECURITY_ATTRIBUTES attributes{};
+    PSECURITY_DESCRIPTOR descriptor=nullptr;
+    PipeSecurity(){
+        HANDLE rawToken=nullptr;uc::Require(OpenProcessToken(GetCurrentProcess(),TOKEN_QUERY,&rawToken)!=FALSE,
+            "control pipe token query failed");
+        struct TokenCloser {HANDLE value;~TokenCloser(){if(value)CloseHandle(value);}} token{rawToken};
+        DWORD bytes=0;GetTokenInformation(rawToken,TokenUser,nullptr,0,&bytes);
+        uc::Require(bytes&&GetLastError()==ERROR_INSUFFICIENT_BUFFER,"control pipe token size query failed");
+        std::vector<unsigned char> buffer(bytes);
+        uc::Require(GetTokenInformation(rawToken,TokenUser,buffer.data(),bytes,&bytes)!=FALSE,
+            "control pipe token identity query failed");
+        auto* user=(TOKEN_USER*)buffer.data();LPWSTR rawSid=nullptr;
+        uc::Require(ConvertSidToStringSidW(user->User.Sid,&rawSid)!=FALSE,"control pipe SID conversion failed");
+        struct LocalCloser {HLOCAL value;~LocalCloser(){if(value)LocalFree(value);}} sid{rawSid};
+        // DACL: only this process user and SYSTEM.  Low mandatory label makes
+        // the duplex pipe reachable by the same user's medium-integrity local
+        // controller even when XXMI launched the game elevated.  Remote pipe
+        // clients remain rejected by PIPE_REJECT_REMOTE_CLIENTS below.
+        std::wstring sddl=L"D:P(A;;GA;;;SY)(A;;GA;;;"+std::wstring(rawSid)+L")S:(ML;;NW;;;LW)";
+        uc::Require(ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(),SDDL_REVISION_1,
+            &descriptor,nullptr)!=FALSE,"control pipe security descriptor creation failed");
+        attributes.nLength=sizeof(attributes);attributes.lpSecurityDescriptor=descriptor;
+        attributes.bInheritHandle=FALSE;
+    }
+    ~PipeSecurity(){if(descriptor)LocalFree(descriptor);}
+};
+
+HANDLE CreateControlPipe(const wchar_t* name,PipeSecurity& security){
+    return CreateNamedPipeW(name,PIPE_ACCESS_DUPLEX|FILE_FLAG_OVERLAPPED,
+        PIPE_TYPE_BYTE|PIPE_READMODE_BYTE|PIPE_WAIT|PIPE_REJECT_REMOTE_CLIENTS,1,65536,65536,0,
+        &security.attributes);
+}
 
 uc::Json Handle(const uc::Json& request){
     using namespace uc;std::string id=request.at("request_id"),command=request.at("command");
@@ -86,10 +123,9 @@ uc::Json ServeConnection(HANDLE pipe,const std::function<uc::Json(const uc::Json
         unsigned char ack=0;Transfer(pipe,&ack,1,false);}
     return response;
 }
-DWORD WINAPI Control(void*){
-    wchar_t name[128];swprintf_s(name,L"\\\\.\\pipe\\UnifiedCapture.%lu",GetCurrentProcessId());
-    for(;;){HANDLE pipe=CreateNamedPipeW(name,PIPE_ACCESS_DUPLEX|FILE_FLAG_OVERLAPPED,
-        PIPE_TYPE_BYTE|PIPE_READMODE_BYTE|PIPE_WAIT|PIPE_REJECT_REMOTE_CLIENTS,1,65536,65536,0,nullptr);
+DWORD WINAPI Control(void*) try {
+    PipeSecurity security;wchar_t name[128];swprintf_s(name,L"\\\\.\\pipe\\UnifiedCapture.%lu",GetCurrentProcessId());
+    for(;;){HANDLE pipe=CreateControlPipe(name,security);
         if(pipe==INVALID_HANDLE_VALUE)return 1;
         OVERLAPPED ov{};ov.hEvent=CreateEventW(nullptr,TRUE,FALSE,nullptr);BOOL connected=ConnectNamedPipe(pipe,&ov);DWORD error=GetLastError();
         if(!connected&&error==ERROR_IO_PENDING){WaitForSingleObject(ov.hEvent,INFINITE);DWORD ignored=0;connected=GetOverlappedResult(pipe,&ov,&ignored,FALSE);}
@@ -97,15 +133,14 @@ DWORD WINAPI Control(void*){
         CloseHandle(ov.hEvent);
         if(connected)ServeConnection(pipe,[](const uc::Json& request){return Handle(request);});
         DisconnectNamedPipe(pipe);CloseHandle(pipe);}
-}
+}catch(const std::exception& e){OutputDebugStringA(e.what());return 1;}
 // Runtime construction failed (bad output root, storage unavailable...): keep
 // the control surface alive so callers learn WHY instead of timing out on a
 // missing pipe and blaming the loader.
-DWORD WINAPI DegradedControl(void* reasonPtr){
+DWORD WINAPI DegradedControl(void* reasonPtr) try {
     std::string reason=(const char*)reasonPtr;delete[] (char*)reasonPtr;
-    wchar_t name[128];swprintf_s(name,L"\\\\.\\pipe\\UnifiedCapture.%lu",GetCurrentProcessId());
-    for(;;){HANDLE pipe=CreateNamedPipeW(name,PIPE_ACCESS_DUPLEX|FILE_FLAG_OVERLAPPED,
-        PIPE_TYPE_BYTE|PIPE_READMODE_BYTE|PIPE_WAIT|PIPE_REJECT_REMOTE_CLIENTS,1,65536,65536,0,nullptr);
+    PipeSecurity security;wchar_t name[128];swprintf_s(name,L"\\\\.\\pipe\\UnifiedCapture.%lu",GetCurrentProcessId());
+    for(;;){HANDLE pipe=CreateControlPipe(name,security);
         if(pipe==INVALID_HANDLE_VALUE)return 1;
         OVERLAPPED ov{};ov.hEvent=CreateEventW(nullptr,TRUE,FALSE,nullptr);BOOL connected=ConnectNamedPipe(pipe,&ov);DWORD error=GetLastError();
         if(!connected&&error==ERROR_IO_PENDING){WaitForSingleObject(ov.hEvent,INFINITE);DWORD ignored=0;connected=GetOverlappedResult(pipe,&ov,&ignored,FALSE);}
@@ -114,7 +149,7 @@ DWORD WINAPI DegradedControl(void* reasonPtr){
         if(connected)ServeConnection(pipe,[&reason](const uc::Json&){return uc::Json{{"ok",false},
             {"state","OBSERVER_WORKER_FAILED"},{"error","observer worker failed to initialize: "+reason}};});
         DisconnectNamedPipe(pipe);CloseHandle(pipe);}
-}
+}catch(const std::exception& e){OutputDebugStringA(e.what());return 1;}
 }
 DWORD WINAPI Bootstrap(void*){
     for(;;){
