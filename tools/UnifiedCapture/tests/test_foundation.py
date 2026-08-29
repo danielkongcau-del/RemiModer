@@ -1,5 +1,6 @@
 from __future__ import annotations
 import copy
+import hashlib
 import json
 from pathlib import Path
 import sqlite3
@@ -11,17 +12,20 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from uc.model import canonical, digest, resolve, validate
 from uc.store import (EvidenceWriter, append_manifest, crc32c, decode_chunk, encode_chunk,
-                      inspect_session, read_manifest)
+                      decode_chunk_file, inspect_session, read_manifest)
+import uc.store as store_module
 from uc.index import EvidenceIndex
+from d0_analyze import _load_finish
+from d0ctl import save_finish_attempt
 
 def plan():
     return {"schema": "uc.capture-plan.v1", "plan_id": "fixture", "plan_revision": 17,
             "modules": {"fixture": {"image": "FixtureHost.exe", "sha256": "1" * 64}},
             "sources": {"fixture": {"path": "synthetic-test-only", "sha256": "2" * 64}},
             "resources": {"slots_per_point": 8, "max_record_bytes": 4096},
-            "points": [{"id": "call", "module": "fixture", "rva": 128, "backend": "gum_attach",
+            "points": [{"id": "call", "module": "fixture", "rva": 128, "backend": "gum_probe",
                         "expected_prefix": "90", "evidence": ["fixture"], "reads": [
-                            {"id": "field", "base": "rcx", "offset": 8, "op": "scalar", "width": 8,
+                            {"id": "field", "base": "rcx", "offset": 8, "op": "scalar", "width": 8, "phase": "enter",
                              "evidence": ["fixture"]}]}]}
 
 def event(identity, qpc, kind="enter"):
@@ -31,6 +35,15 @@ def event(identity, qpc, kind="enter"):
 class PlanTests(unittest.TestCase):
     def test_valid(self):
         self.assertEqual(validate(plan())["points"], 1)
+
+    def test_v2_schema_accepts_register_base(self):
+        try:
+            import jsonschema
+        except ImportError:
+            self.skipTest("jsonschema is an optional schema-test dependency")
+        schema = json.loads((ROOT / "schemas/capture-plan-v2.schema.json").read_text(encoding="utf-8"))
+        base_schema = schema["properties"]["observations"]["items"]["properties"]["entry"]["properties"]["reads"]["items"]["properties"]["base"]
+        jsonschema.Draft202012Validator(base_schema).validate("rcx")
 
     def test_canonical_key_order(self):
         p = plan()
@@ -79,7 +92,7 @@ class PlanTests(unittest.TestCase):
             lambda p: p["points"][0]["reads"][0].update(base="arg0"),
             lambda p: p["points"][0]["reads"][0].update(width=3),
             lambda p: p["points"][0]["reads"][0].update(evidence=[]),
-            lambda p: p["points"][0].update(backend="gum_probe"),
+            lambda p: p["points"][0].update(backend="gum_attach"),
             lambda p: p["points"][0].update(backend="slot"),
         ]
         for number, mutate in enumerate(mutations):
@@ -95,10 +108,93 @@ class StoreTests(unittest.TestCase):
         self.path = Path(self.temp.name)
 
     def tearDown(self):
+        store_module._DECODE_CACHE.clear()
+        store_module._DECODE_CACHE_BYTES = 0
         self.temp.cleanup()
 
     def test_crc32c_known_vector(self):
         self.assertEqual(crc32c(b"123456789"), 0xe3069283)
+
+    def test_crc32c_slicing_on_long_input(self):
+        # Exercise multiple 8-byte slices plus a remainder, against the same
+        # known-answer construction as the reference byte loop.
+        payload = bytes(range(256)) * 5 + b"tail"
+        reference = 0xffffffff
+        table = []
+        for value in range(256):
+            for _ in range(8):
+                value = (value >> 1) ^ (0x82f63b78 if value & 1 else 0)
+            table.append(value)
+        for byte in payload:
+            reference = (reference >> 8) ^ table[(reference ^ byte) & 255]
+        self.assertEqual(crc32c(payload), reference ^ 0xffffffff)
+
+    def test_manifest_chain_detects_deletion_and_reordering(self):
+        writer = EvidenceWriter(self.path / "session", "chain")
+        writer.write([(event(1, 1), b"abc")])
+        append_manifest(writer.manifest, {"kind": "user_mark", "label": "mid", "qpc": 5})
+        writer.close()
+        lines = writer.manifest.read_bytes().splitlines(keepends=True)
+        # Deleting a middle line breaks the prev_sha256 linkage.
+        deleted = b"".join(lines[:1] + lines[2:])
+        other = self.path / "deleted.manifest"
+        other.write_bytes(deleted)
+        _, errors = read_manifest(other)
+        self.assertTrue(any("chain" in error for error in errors), errors)
+        # Swapping two sealed lines also breaks the chain.
+        swapped = self.path / "swapped.manifest"
+        swapped.write_bytes(b"".join(lines[1:2] + lines[0:1] + lines[2:]))
+        _, errors = read_manifest(swapped)
+        self.assertTrue(any("chain" in error for error in errors), errors)
+
+    def test_manifest_chain_can_follow_verified_legacy_lines(self):
+        path = self.path / "legacy.manifest"
+        records = [{"kind": "session", "session_id": "legacy"}, {"kind": "user_mark", "qpc": 1}]
+        with path.open("wb") as stream:
+            for record in records:
+                stream.write(canonical({"record": record, "sha256": hashlib.sha256(canonical(record)).hexdigest()}) + b"\n")
+        append_manifest(path, {"kind": "session_end", "session_id": "legacy"})
+        decoded, errors = read_manifest(path)
+        self.assertFalse(errors, errors)
+        self.assertEqual([row["kind"] for row in decoded], ["session", "user_mark", "session_end"])
+
+    def test_decode_cache_enforces_total_weight(self):
+        old_limit = store_module._DECODE_CACHE_MAX_BYTES
+        try:
+            store_module._DECODE_CACHE_MAX_BYTES = 900
+            for identity in (1, 2):
+                encoded, _ = encode_chunk("cache", identity, [(event(identity, identity), bytes(512))])
+                path = self.path / f"cache-{identity}.ucb"
+                path.write_bytes(encoded)
+                decode_chunk_file(path)
+            self.assertLessEqual(store_module._DECODE_CACHE_BYTES, store_module._DECODE_CACHE_MAX_BYTES)
+            self.assertLessEqual(len(store_module._DECODE_CACHE), 1)
+        finally:
+            store_module._DECODE_CACHE_MAX_BYTES = old_limit
+
+    def test_plan_accepts_entry_predicate_and_string_reads(self):
+        p = plan()
+        p["points"][0]["reads"] = [
+            {"id": "kind", "base": "rcx", "op": "scalar", "width": 8, "phase": "enter",
+             "when": {"op": "eq", "value": 7, "mask": 255}, "evidence": ["fixture"]},
+            {"id": "name", "base": "rdx", "op": "string", "max_bytes": 64, "phase": "enter",
+             "evidence": ["fixture"]},
+            {"id": "count", "base": "r8", "op": "scalar", "width": 4, "phase": "enter",
+             "evidence": ["fixture"]},
+            {"id": "items", "base": "r9", "op": "array", "count_from": "count", "stride": 4,
+             "max_count": 8, "phase": "enter", "evidence": ["fixture"]},
+        ]
+        self.assertEqual(validate(p)["points"], 1)
+        # Predicates are enter-phase only and scalar-only.
+        for mutate in (lambda r: r.update(phase="leave"),
+                       lambda r: r.update(op="block", size=8),
+                       lambda r: r["when"].update(op="lt")):
+            with self.subTest(mutate=mutate):
+                broken = plan()
+                broken["points"][0]["reads"] = copy.deepcopy(p["points"][0]["reads"])
+                mutate(broken["points"][0]["reads"][0])
+                with self.assertRaises(ValueError):
+                    validate(broken)
 
     def test_binary_roundtrip(self):
         raw = bytes(range(256)) + b"\x00\x00\xc0\x7f"  # NaN bits, not a JSON float
@@ -176,6 +272,20 @@ class StoreTests(unittest.TestCase):
             idx.db.execute("INSERT INTO causal_edges VALUES(?,?,?,?)", (ref, ref, ref, "nearby_time"))
         idx.close()
 
+    def test_index_migrates_pre_reads_schema(self):
+        path = self.path / "old-index.db"
+        db = sqlite3.connect(path)
+        db.execute("""CREATE TABLE events(
+            source TEXT NOT NULL, session TEXT NOT NULL, event_id TEXT NOT NULL,
+            offset INTEGER NOT NULL, length INTEGER NOT NULL, offset_domain TEXT NOT NULL,
+            kind TEXT, qpc TEXT, tid TEXT, point TEXT, generation TEXT, invocation TEXT,
+            observed_parent TEXT, metadata TEXT NOT NULL, PRIMARY KEY(source,offset))""")
+        db.commit();db.close()
+        idx = EvidenceIndex(path)
+        columns = {row[1] for row in idx.db.execute("PRAGMA table_info(events)")}
+        self.assertIn("reads", columns)
+        idx.close()
+
     def test_absence_requires_coverage(self):
         writer = EvidenceWriter(self.path / "session", "one")
         writer.write([(event(1, 1), b"")])
@@ -212,6 +322,15 @@ class StoreTests(unittest.TestCase):
             json.loads(data[offset:offset + length])
         self.assertEqual(path.read_bytes(), data)
         idx.close()
+
+    def test_finish_attempts_use_monotonic_immutable_sequence(self):
+        legacy = self.path / "finish-attempt-100-old.json"
+        legacy.write_bytes(canonical({"state": "OLD"}))
+        first = save_finish_attempt(self.path, {"state": "FIRST"})
+        second = save_finish_attempt(self.path, {"state": "SECOND"})
+        self.assertEqual(int(first.stem.split("-")[2]), 101)
+        self.assertEqual(int(second.stem.split("-")[2]), 102)
+        self.assertEqual(_load_finish(self.path)["state"], "SECOND")
 
 if __name__ == "__main__":
     unittest.main()

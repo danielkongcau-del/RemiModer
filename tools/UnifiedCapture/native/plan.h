@@ -2,10 +2,13 @@
 #include "common.h"
 #include <functional>
 namespace uc {
-enum class Backend { Slot, GumAttach, GumProbe };
+enum class Backend { Slot, GumProbe };
 enum class PointMode { Single, ProbePair };
-enum class Base { Register, Argument, Previous, Module };
-enum class Op { Scalar, Relative, Block, Array };
+enum class Base { Register, EntryRegister, Argument, Previous, Module };
+enum class Op { Scalar, Relative, Block, Array, CString };
+// Hard ceiling on combined per-point pool preallocation. A bad plan must fail
+// validation, not allocate gigabytes inside the observed process.
+constexpr uint64_t MaxPlanPreallocationBytes = 256ull << 20;
 enum Reg { Rax,Rbx,Rcx,Rdx,Rsi,Rdi,Rbp,Rsp,R8,R9,R10,R11,R12,R13,R14,R15,Rip,RegCount };
 inline const char* RegNames[]={"rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp","r8","r9","r10","r11","r12","r13","r14","r15","rip"};
 struct Abi {
@@ -19,10 +22,14 @@ struct ReadOp {
     std::string id;Base base=Base::Register;Op op=Op::Scalar;
     uint32_t index=0,phase=3;uint64_t moduleBase=0,offset=0,size=8,stride=0,maxCount=0;
     uint32_t countIndex=0;
+    // Entry-phase predicate: the event is filtered (not recorded, counted
+    // separately from loss) unless the loaded scalar matches. Evaluated on the
+    // raw loaded bits before any relative adjustment.
+    bool hasPredicate=false,predicateNegate=false;uint64_t predicateValue=0,predicateMask=~0ull;
 };
 struct ReadResult {
     uint64_t address=0,value=0,count=0;uint32_t begin=0,bytes=0,status=0;
-    // 0=not sampled at this phase; 1=ok; 2=unavailable base; 3=read failed; 4=truncated; 5=overflow
+    // 0=not sampled at this phase; 1=ok; 2=unavailable base; 3=read failed; 4=truncated; 5=overflow; 6=filtered by plan predicate
 };
 struct Record {
     uint64_t id=0,qpc=0,endQpc=0,invocation=0,parent=0;uint32_t tid=0;
@@ -59,6 +66,14 @@ struct Point {
     uint32_t requiredRedirectSpan=0;
     std::vector<ExitSite> exits;
     std::unique_ptr<Cell[]> pool;std::atomic<uint64_t> next{0},inFlight{0};Loss loss;
+    // Semaphore for O(1) rejection when the pool is exhausted instead of an
+    // O(poolSize) CAS scan per event. Owned by Acquire/worker release.
+    std::atomic<uint32_t> freeSlots{0};
+    // Deliberate predicate filtering is accounted independently from loss.
+    std::atomic<uint64_t> filtered{0};
+    // Per-plan evidence retention. The raw backend context is copied before a
+    // logical point is selected; false suppresses XMM from the stored record.
+    bool captureXmm=true;
     Json lastReportedLoss; // Writer thread only, never inspected in a callback.
     uint64_t coverageBegin=0,coverageEnd=0;
     // Legacy extensions are data readers, never gameplay interpreters.
@@ -75,7 +90,16 @@ struct Generation {
     // share one listener; partial overlaps are rejected by Compile/Runtime.
     std::vector<std::vector<std::shared_ptr<Point>>> byHook;
     std::atomic<uint64_t> inFlight{0};
+    uint32_t pairFrameLimit=256,threadNestingLimit=256;
+    // Set when forced drain reclaims incomplete paired frames; late cleanup
+    // must not decrement shared counters a second time.
+    std::atomic<bool> reclaimed{false};
+    // Fast-path module liveness epoch (see Runtime::Begin). Refreshed in the
+    // callback only when the process-wide module epoch serial changed.
+    std::atomic<uint64_t> moduleVerifiedEpoch{0};
 };
 std::shared_ptr<Generation> Compile(const Json&,const std::function<uint64_t(uint64_t)>& slotResolver={});
-void Capture(Point&,Record&,const Abi&,const Abi&,uint32_t phase) noexcept;
+// Returns false when an entry-phase predicate filtered the event; the caller
+// must release the cell/payload without recording and count it as filtered.
+bool Capture(Point&,Record&,const Abi&,const Abi&,uint32_t phase) noexcept;
 }

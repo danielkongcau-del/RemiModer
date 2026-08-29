@@ -7,14 +7,30 @@ import json
 from pathlib import Path
 from typing import Any
 
+from uc.cli import run_main
 from uc.caller import entry_return_address, resolve_callsite
 from uc.model import canonical, file_hash
 from uc.native_manifest import NativePE
-from uc.store import decode_chunk, inspect_session, read_manifest
+from uc.store import decode_chunk_file, inspect_session, read_manifest
 
 
 def _load(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def _load_finish(run: Path) -> dict[str, Any]:
+    def order(path: Path):
+        token = path.stem[len("finish-attempt-"):].split("-", 1)[0]
+        return (int(token) if token.isdigit() else -1, path.name)
+    attempts = sorted(run.glob("finish-attempt-*.json"), key=order)
+    if attempts:
+        # Attempt sequence is allocated by exclusive file creation. It is the
+        # protocol order and is immune to copied mtimes or wall-clock rollback.
+        return _load(attempts[-1])
+    final = run / "finish-result.json"
+    if final.exists():
+        return _load(final)
+    return {"clean": False, "state": "FINISH_RESULT_MISSING"}
 
 
 def _save_new(path: Path, value: Any) -> None:
@@ -28,7 +44,7 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None) -> dict[s
     intent = _load(run / "intent.json")
     activation = _load(run / "activation-response.json")
     orchestration = _load(run / "result.json")
-    finish = _load(run / "finish-result.json")
+    finish = _load_finish(run)
     qualification = _load(run / "site-qualification-evidence.json")
     derived_report = _load(run / "derived/report.json")
     derived_plan = _load(Path(derived_report["entry_plan"]["path"]))
@@ -48,7 +64,7 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None) -> dict[s
     for chunk in inspection["chunks"]:
         chunk_path = session / chunk["file"]
         chunk_sources.append({"path": str(chunk_path), "sha256": file_hash(chunk_path)})
-        _, records = decode_chunk(chunk_path.read_bytes())
+        _, records = decode_chunk_file(chunk_path)
         for _, _, event, blob in records:
             if event.get("point") == point and event.get("generation") == generation:
                 events.append(event)
@@ -112,11 +128,17 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None) -> dict[s
             source = next(iter(derived_plan.get("sources", {}).values()), None)
         if source and Path(source["path"]).is_file() and file_hash(Path(source["path"])) == source.get("sha256"):
             native_image = NativePE(Path(source["path"]))
+            observed_points = {binding.get("address"): binding.get("point")
+                               for row in activations for binding in row.get("bindings", [])}
             for event in window_events:
                 observed = entry_return_address(event, event_blobs[event["event_id"]])
                 if observed is not None:
                     resolved = resolve_callsite(observed, active_binding, native_image)
                     resolved["event_id"] = event["event_id"]
+                    target_rva = (resolved.get("predecessor_instruction") or {}).get("direct_target_rva")
+                    base = active_binding.get("module_base")
+                    if target_rva is not None and isinstance(base, int) and base + target_rva in observed_points:
+                        resolved["direct_target_is_observed_point"] = observed_points[base + target_rva]
                     caller_evidence.append(resolved)
     qualified_process = qualification.get("response", {}).get("target_process", {})
     process_binding = derived_plan.get("process_binding", {})
@@ -199,4 +221,4 @@ if __name__ == "__main__":
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--ledger", type=Path)
     args = parser.parse_args()
-    print(json.dumps(analyze_run(args.run, args.out, args.ledger), ensure_ascii=False))
+    print(json.dumps(run_main(analyze_run, args.run, args.out, args.ledger), ensure_ascii=False))

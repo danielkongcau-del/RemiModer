@@ -12,6 +12,7 @@ import copy
 import json
 from pathlib import Path
 
+from uc.cli import run_main, write_failure
 from uc.model import canonical, file_hash
 from uc.native_manifest import validate_exit_manifest
 from uc.probe_pair import compile_probe_pair
@@ -134,4 +135,12 @@ if __name__ == "__main__":
     parser.add_argument("--function-id", required=True)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
-    run(args.manifest.resolve(), args.evidence.resolve(), args.function_id, args.out.resolve())
+    def invoke():
+        try:
+            return run(args.manifest.resolve(), args.evidence.resolve(), args.function_id, args.out.resolve())
+        except Exception as error:
+            write_failure(args.out, "apply_site_qualification", error,
+                          {"manifest": str(args.manifest), "evidence": str(args.evidence),
+                           "function_id": args.function_id})
+            raise
+    run_main(invoke)

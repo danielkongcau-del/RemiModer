@@ -57,11 +57,16 @@ void AppendFile(const fs::path& path,const void* data,size_t size){HANDLE f=Crea
     Require(f!=INVALID_HANDLE_VALUE,"manifest open failed");try{WriteHandle(f,data,size);Require(FlushFileBuffers(f),"manifest flush failed");}
     catch(...){CloseHandle(f);throw;}CloseHandle(f);}
 std::string UniqueId(){unsigned char raw[16];Require(BCryptGenRandom(nullptr,raw,16,BCRYPT_USE_SYSTEM_PREFERRED_RNG)>=0,"session randomness");return Hex(raw,16);}
+std::string WallClockUtc(){FILETIME file{};GetSystemTimeAsFileTime(&file);SYSTEMTIME utc{};
+    FileTimeToSystemTime(&file,&utc);char text[40];
+    sprintf_s(text,"%04u-%02u-%02uT%02u:%02u:%02u.%03uZ",utc.wYear,utc.wMonth,utc.wDay,utc.wHour,utc.wMinute,utc.wSecond,utc.wMilliseconds);
+    return text;}
 Module ResolveModule(const std::string& alias,const Json& wanted){
     std::string image=wanted.at("image");std::wstring wide=Utf8(image).wstring();HMODULE h=nullptr;
     if(!GetModuleHandleExW(0,wide.c_str(),&h))throw std::runtime_error("WAITING_MODULE:"+alias);
     struct Ref {HMODULE handle;~Ref(){FreeLibrary(handle);}} ref{h};
-    wchar_t path[32768];Require(GetModuleFileNameW(h,path,32768)>0,"module path");MODULEINFO info{};
+    wchar_t path[32768];auto pathSize=GetModuleFileNameW(h,path,(DWORD)std::size(path));
+    Require(pathSize>0&&pathSize<std::size(path),"module path unavailable or truncated");MODULEINFO info{};
     Require(GetModuleInformation(GetCurrentProcess(),h,&info,sizeof(info)),"module information");
     Module m;m.alias=alias;m.image=image;m.path=path;m.base=(uint64_t)h;m.size=info.SizeOfImage;m.sha=FileSha(m.path);
     Require(m.sha==wanted.at("sha256").get<std::string>(),"module hash mismatch");

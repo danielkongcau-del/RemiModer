@@ -47,7 +47,7 @@ struct Probe {
         g_object_unref(listener);}if(interceptor)g_object_unref(interceptor);}
     uc::Json Evidence()const{
         uc::Json changed=uc::Json::array();for(size_t i=0;i<before.size();++i)if(before[i]!=after[i])changed.push_back(i);
-        return {{"attach_status",(int)status},{"before",uc::Hex(before.data(),before.size())},
+        return {{"probe_install_status",(int)status},{"before",uc::Hex(before.data(),before.size())},
             {"after",uc::Hex(after.data(),after.size())},{"changed_byte_offsets",changed}};
     }
 };

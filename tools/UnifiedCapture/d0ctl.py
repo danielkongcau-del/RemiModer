@@ -9,6 +9,7 @@ import uuid
 
 from capturectl import request
 from p1_apply_site_qualification import run as apply_qualification
+from uc.cli import run_main
 from uc.model import canonical, file_hash
 from uc.probe_pair import compile_probe_pair
 from uc.site_qualification import validate_site_qualification
@@ -17,6 +18,28 @@ from uc.site_qualification import validate_site_qualification
 def save_new(path: Path, value):
     with path.open("xb") as stream:
         stream.write(canonical(value))
+
+
+def save_finish_attempt(output: Path, value):
+    """Append an immutable, monotonically sequenced finish attempt.
+
+    Wall clocks and mtimes can move backwards or be changed by file copies.
+    Exclusive creation resolves concurrent finish clients without overwriting
+    either result.
+    """
+    prefix = "finish-attempt-"
+    sequence = 1
+    for path in output.glob(prefix + "*.json"):
+        token = path.stem[len(prefix):].split("-", 1)[0]
+        if token.isdigit():
+            sequence = max(sequence, int(token) + 1)
+    while True:
+        path = output / f"{prefix}{sequence:020d}.json"
+        try:
+            save_new(path, value)
+            return path
+        except FileExistsError:
+            sequence += 1
 
 
 def prepare_apply(pid: int, qualification_path: Path, manifest_path: Path,
@@ -66,11 +89,28 @@ def prepare_apply(pid: int, qualification_path: Path, manifest_path: Path,
     activation_path = output / "activation-response.json"
     if not activation_path.exists():
         activation = request(pid, "apply", request_id=intended["apply_request_id"], plan=plan)
+        # WAITING_* means the plan is parked pending module availability — the
+        # observer answers ok:true without a generation. Poll until it resolves
+        # (or fail loudly) so a persisted "success" can never mean "not active".
+        while activation.get("ok") and "generation" not in activation:
+            status = request(pid, "status")
+            if not status.get("waiting_plan") and status.get("bootstrap_error"):
+                raise RuntimeError({"error": "apply failed while waiting for modules",
+                                    "bootstrap_error": status["bootstrap_error"],
+                                    "state": status.get("state")})
+            # Replay the idempotent apply only once the parked plan resolved,
+            # so the retry returns the real receipt instead of the reserved
+            # EXECUTION_UNCERTAIN placeholder.
+            if not status.get("waiting_plan"):
+                activation = request(pid, "apply", request_id=intended["apply_request_id"], plan=plan)
+                continue
+            time.sleep(.5)
         save_new(activation_path, activation)
     else:
         activation = json.loads(activation_path.read_text(encoding="utf-8-sig"))
-    if not activation.get("ok"):
-        raise RuntimeError(activation)
+    if not activation.get("ok") or "generation" not in activation:
+        raise RuntimeError({"error": "activation did not produce a generation",
+                            "activation": activation})
     armed_path = output / "armed-mark-response.json"
     if not armed_path.exists():
         armed = request(pid, "mark", request_id=intended["armed_mark_request_id"],
@@ -120,16 +160,32 @@ def finish_capture(pid: int, output: Path, wait_seconds: float = 30.0):
     deadline = time.monotonic() + wait_seconds
     while True:
         status = request(pid, "status")
-        if status.get("state") == "STOPPED_CLEAN" or time.monotonic() >= deadline:
+        # A forced stop is terminal too.  It is deliberately not "clean", but
+        # waiting for the whole client deadline cannot improve it and only
+        # hides the actual terminal outcome from the operator.
+        if status.get("state") in ("STOPPED_CLEAN", "STOPPED_FORCED") \
+                or status.get("storage_error") or time.monotonic() >= deadline:
             break
         time.sleep(.05)
+    clean = status.get("state") == "STOPPED_CLEAN"
     result = {"schema": "uc.d0-finish-result.v1", "pid": pid,
         "state": status.get("state"), "generation": status.get("generation"),
         "session_id": status.get("session_id"), "directory": status.get("directory"),
         "storage_error": status.get("storage_error"), "loss": status.get("loss"),
-        "clean": status.get("state") == "STOPPED_CLEAN"}
+        "admission_window_drops": status.get("admission_window_drops"),
+        "clean": clean}
+    if not clean:
+        result["failure_attribution"] = {
+            "DRAIN_PENDING": "callbacks or sealing still in flight; re-run finish or use a forced stop",
+            "MODULE_REBIND_PENDING": "a bound module was reloaded; rebind and requalify",
+            "STOPPED_FORCED": "stop required a forced drain; treat evidence as unclean",
+            "STORAGE_FAILED": "evidence persistence failed; admission is closed and the session cannot be sealed cleanly",
+        }.get(status.get("state"), "session ended without a clean seal; inspect the session directory")
+    # Persist every attempt so analyzers can attribute non-clean intermediate
+    # endings. The immutable conventional result is created only once clean.
     result_path = output / "finish-result.json"
-    if result["clean"] and not result_path.exists():
+    save_finish_attempt(output, result)
+    if clean and not result_path.exists():
         save_new(result_path, result)
     print(json.dumps(result, ensure_ascii=False))
     return result
@@ -150,7 +206,9 @@ if __name__ == "__main__":
     finish.add_argument("--wait-seconds", type=float, default=30.0)
     args = parser.parse_args()
     if args.command == "prepare-apply":
-        prepare_apply(args.pid, args.qualification.resolve(), args.manifest.resolve(),
-                      args.function_id, args.out.resolve())
+        run_main(prepare_apply, args.pid, args.qualification.resolve(), args.manifest.resolve(),
+                 args.function_id, args.out.resolve())
     else:
-        finish_capture(args.pid, args.run, args.wait_seconds)
+        result = run_main(finish_capture, args.pid, args.run, args.wait_seconds)
+        if not result.get("clean"):
+            raise SystemExit(1)

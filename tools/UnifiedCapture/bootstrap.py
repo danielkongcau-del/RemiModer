@@ -27,12 +27,16 @@ def main():
             request = urllib.request.Request(url, headers={"User-Agent": "UnifiedCapture-dependency-bootstrap"})
             with urllib.request.urlopen(request, timeout=60) as response:
                 data = response.read()
-            if hashlib.sha256(data).hexdigest() != wanted:
-                raise ValueError(f"download hash mismatch: {name}")
+            digest = hashlib.sha256(data).hexdigest()
+            if digest != wanted:
+                raise ValueError(f"download hash mismatch: {name}: expected {wanted}, got {digest}; "
+                                 "re-run to retry the download or update the pinned digest deliberately")
             with target.open("xb") as stream:
                 stream.write(data)
-        if hashlib.sha256(data).hexdigest() != wanted:
-            raise ValueError(f"existing dependency hash mismatch: {target}")
+        digest = hashlib.sha256(data).hexdigest()
+        if digest != wanted:
+            raise ValueError(f"existing dependency hash mismatch: {target}: expected {wanted}, got {digest}; "
+                             "delete the file to re-download or update the pinned digest deliberately")
         print(f"VERIFIED {name} {wanted}", flush=True)
     destination = cache / "gum-17.17.0"
     destination.mkdir(exist_ok=True)
@@ -62,6 +66,5 @@ def main():
     else:
         with manifest_path.open("xb") as stream:
             stream.write(encoded)
-
 if __name__ == "__main__":
     main()

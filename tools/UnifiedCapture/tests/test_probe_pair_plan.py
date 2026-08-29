@@ -1,4 +1,7 @@
 from __future__ import annotations
+import sys
+from pathlib import Path
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 import copy
 import hashlib
@@ -89,13 +92,15 @@ class ProbePairPlanTests(unittest.TestCase):
 
     def test_partial_overlap_rejected(self):
         value = self.make_plan(2)
-        value["observations"][1]["entry"]["rva"] = 0x102
+        # Near redirects change only five bytes, but Gum owns a 16-byte
+        # relocation window. +8 must therefore still be rejected.
+        value["observations"][1]["entry"]["rva"] = 0x108
         value["observations"][1]["native_exit_manifest"]["function_id"] = "G"
         path = Path(value["observations"][1]["native_exit_manifest"]["path"])
         data = manifest()
         second = copy.deepcopy(data["functions"][0])
         second["function_id"] = "G"
-        second["entry_rva"] = 0x102
+        second["entry_rva"] = 0x108
         data["functions"].append(second)
         path.write_bytes(canonical(data))
         digest = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -121,6 +126,72 @@ class ProbePairPlanTests(unittest.TestCase):
         value["observations"][0]["native_exit_manifest"]["sha256"] = "0" * 64
         with self.assertRaisesRegex(ValueError, "manifest changed"):
             compile_probe_pair(value, verify_sources=False)
+
+    def test_phase_read_program_matches_native_base_and_dependency_rules(self):
+        value = self.make_plan()
+        reads = value["observations"][0]["entry"]["reads"]
+        reads.extend([
+            {"id": "global", "base": "module:fixture", "offset": 32, "op": "scalar",
+             "width": 8, "phase": "enter", "evidence": ["fixture"]},
+            {"id": "child", "base": "global", "op": "block", "size": 16,
+             "phase": "enter", "evidence": ["fixture"]},
+            {"id": "receiver-after", "base": "entry:rcx", "op": "scalar", "width": 8,
+             "phase": "leave", "evidence": ["fixture"]},
+            {"id": "leave-child", "base": "receiver-after", "op": "block", "size": 8,
+             "phase": "leave", "evidence": ["fixture"]},
+        ])
+        self.assertEqual(len(compile_probe_pair(value).sites), 2)
+
+        for mutate, message in (
+            (lambda rows: rows[1].update(phase="leave"), "selected phase"),
+            (lambda rows: rows.append({"id": "grandchild", "base": "child", "op": "scalar",
+                                       "width": 8, "phase": "enter", "evidence": ["fixture"]}), "dependency"),
+            (lambda rows: rows[1].update(size=0), "block size"),
+            (lambda rows: rows[2].update(phase="enter"), "leave-phase only"),
+            (lambda rows: rows[2].update(when={"op": "eq", "value": 1}), "enter-phase"),
+        ):
+            broken = copy.deepcopy(value)
+            mutate(broken["observations"][0]["entry"]["reads"])
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                compile_probe_pair(broken)
+
+    def test_leave_reads_require_exits_and_use_a_per_phase_budget(self):
+        entry_only = self.make_plan(requirement="none")
+        entry_only["observations"][0]["entry"]["reads"].append(
+            {"id": "after", "base": "entry:rcx", "op": "scalar", "width": 8,
+             "phase": "leave", "evidence": ["fixture"]})
+        with self.assertRaisesRegex(ValueError, "exit capture requirement"):
+            compile_probe_pair(entry_only)
+
+        value = self.make_plan()
+        value["resources"]["max_record_bytes"] = 16
+        value["observations"][0]["entry"]["reads"] = [
+            {"id": "before", "base": "module:fixture", "op": "block", "size": 16,
+             "phase": "enter", "evidence": ["fixture"]},
+            {"id": "after", "base": "module:fixture", "op": "block", "size": 16,
+             "phase": "leave", "evidence": ["fixture"]},
+        ]
+        self.assertEqual(len(compile_probe_pair(value).sites), 2)
+        value["observations"][0]["entry"]["reads"].append(
+            {"id": "too-much-after", "base": "module:fixture", "op": "scalar", "width": 1,
+             "phase": "leave", "evidence": ["fixture"]})
+        with self.assertRaisesRegex(ValueError, "per-phase"):
+            compile_probe_pair(value)
+
+    def test_resource_and_redirect_contracts_match_native_compiler(self):
+        for mutate, message in (
+            (lambda value: value["resources"].update(max_record_bytes=0), "max_record_bytes"),
+            (lambda value: value["resources"].update(call_frames_per_function=257), "native maximum"),
+            (lambda value: value["resources"].update(thread_nesting_limit=257), "native maximum"),
+            (lambda value: value["observations"][0]["entry"]["backend_patch_contract"].update(
+                redirect_kind="far", required_redirect_span=5), "redirect"),
+            (lambda value: value["observations"][0]["entry"]["backend_patch_contract"].update(
+                relocated_span=17), "redirect"),
+        ):
+            value = self.make_plan()
+            mutate(value)
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                compile_probe_pair(value)
 
 
 if __name__ == "__main__":

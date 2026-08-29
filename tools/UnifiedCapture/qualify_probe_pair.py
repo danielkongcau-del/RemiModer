@@ -6,6 +6,7 @@ import json
 from pathlib import Path
 import shutil
 
+from uc.cli import run_main, write_failure
 from uc.model import file_hash
 
 
@@ -90,7 +91,7 @@ def run(report_path: Path, output: Path):
             "enabled_in_fixture": any(row.get("cet_user_shadow_stack_enabled") for row in policies),
             "strict_in_fixture": any(row.get("cet_user_shadow_stack_strict_mode") for row in policies),
             "target_runtime_check_required": True},
-        "scope": {"game_runtime_verified": False, "gum_attach_failure_superseded": False,
+        "scope": {"game_runtime_verified": False,
                   "arbitrary_instruction_class_qualified": False,
                   "qualified_relocation_classes": ["faulting-memory-load", "relative-call", "pure-epilogue"]},
     }
@@ -111,4 +112,10 @@ if __name__ == "__main__":
     parser.add_argument("--report", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
-    run(args.report.resolve(), args.out.resolve())
+    def invoke():
+        try:
+            return run(args.report.resolve(), args.out.resolve())
+        except Exception as error:
+            write_failure(args.out, "qualify_probe_pair", error, {"report": str(args.report)})
+            raise
+    run_main(invoke)

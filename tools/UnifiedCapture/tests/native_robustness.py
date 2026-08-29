@@ -125,8 +125,6 @@ def run():
         plan = h.make_plan(("recursive", "mixed", "probe"))
         for p in plan["points"]:
             p["reads"] = []
-            if p["id"] == "probe":
-                p["backend"] = "gum_probe"
             if p["id"] == "mixed":
                 p["reads"] = [{"id": "mixed-struct", "base": "r8", "op": "block", "size": 16,
                                "phase": "enter", "evidence": ["fixture"]}]
@@ -137,9 +135,8 @@ def run():
         end = h.stop()
         rows = records(end["directory"])
         recursion = [e for e, b in rows if e["point"] == "recursive"]
-        assert len(recursion) == 12
-        enters = [e for e in recursion if e["kind"] == "enter"]
-        assert all(enters[i]["observed_parent"] == enters[i-1]["invocation_id"] for i in range(1, 6))
+        assert len(recursion) == 6 and all(e["kind"] == "probe" for e in recursion)
+        assert all("invocation_id" not in e for e in recursion)
         probe = [e for e, b in rows if e["point"] == "probe"]
         assert len(probe) == 1 and probe[0]["kind"] == "probe" and "invocation_id" not in probe[0]
         mixed = [(e, b) for e, b in rows if e["point"] == "mixed"]
@@ -147,16 +144,19 @@ def run():
         assert struct.unpack("<dQ", blob) == (3.5, 9)
         assert struct.unpack("<d", bytes.fromhex(e["raw_abi"]["xmm"]["0"])[:8])[0] == 1.25
         assert struct.unpack("<f", bytes.fromhex(e["raw_abi"]["xmm"]["1"])[:4])[0] == 2.5
-        assert struct.unpack("<d", bytes.fromhex(mixed[1][0]["raw_abi"]["xmm"]["0"])[:8])[0] == 16.25
-        graph = execution_graph(end["directory"], root / "gum-graph.json")
-        assert graph["observed_nesting_edges"] == 5
-        return {"recursive_calls": 6, "probe_events": 1, "xmm_float_double_struct": "verified"}
-    case("gum-reentrancy-probe-and-abi", abi)
+        assert len(mixed) == 1 and e["kind"] == "probe"
+        graph = execution_graph(end["directory"], root / "probe-graph.json")
+        assert graph["observed_nesting_edges"] == 0
+        return {"recursive_probe_events": 6, "probe_events": 1,
+                "entry_xmm_float_double_struct": "verified"}
+    case("instruction-probe-reentrancy-and-entry-abi", abi)
 
     def readers_unavailable(h):
-        capabilities = h.control("capabilities")["capabilities"]["frozen_readers"]
-        assert capabilities == {"available": False, "reason": "target-bound-readers-not-in-public-build"}
-        return capabilities
+        capabilities = h.control("capabilities")["capabilities"]
+        assert capabilities["backends"] == ["slot", "gum_probe", "gum_function_probe_pair"]
+        readers = capabilities["frozen_readers"]
+        assert readers == {"available": False, "reason": "target-bound-readers-not-in-public-build"}
+        return {"frozen_readers": readers, "supported_backends": capabilities["backends"]}
     case("target-bound-readers-explicitly-unavailable", readers_unavailable)
 
     def live_slot(h):
@@ -185,25 +185,6 @@ def run():
         assert h.stop()["generation"] == 1
         return {"lost_response_retry_generation": 1, "control_disconnect_does_not_stop_capture": True}
     case("disconnect-and-idempotent-receipt", disconnected_receipt)
-
-    def gum_exception(h):
-        plan = h.make_plan(("gum_raise",))
-        plan["points"][0]["reads"] = []
-        h.control("apply", plan=plan)
-        assert h.invoke("gum_raise")["caught"]
-        h.control("stop")
-        time.sleep(.15)
-        status = h.control("status")
-        # Gum does not promise paired leave delivery on arbitrary SEH unwind.
-        # If it supplies no leave, retain resources and make incompleteness visible.
-        if status["state"] == "STOPPED_CLEAN":
-            rows = records(status["directory"])
-            assert len(rows) == 2
-        else:
-            assert status["state"] == "DRAIN_PENDING" and status["in_flight"] == 1
-            assert not inspect_session(Path(status["directory"]))["storage_complete"]
-        return {"native_exception_caught": True, "state": status["state"], "in_flight": status["in_flight"]}
-    case("gum-SEH-unwind-accounting", gum_exception)
 
     def probe_exception(h):
         plan = h.make_plan(("gum_raise",))
@@ -254,6 +235,41 @@ def run():
         return {"waiting_then_activation": True, "reload_generation": 2, "scope": "non-hooked dependent module"}
     case("module-wait-and-rebind", module_epoch)
 
+    def pending_plan_ownership_and_cancel(h):
+        plan = h.make_plan(("mutate",))
+        plan["modules"]["dependency"] = {
+            "image": "FixtureModule.dll",
+            "sha256": file_hash(ROOT / "build/FixtureModule.dll"),
+        }
+        waiting = h.control("apply", request_id="pending-plan-a", plan=plan)
+        assert waiting["state"] == "WAITING_MODULE", waiting
+
+        # A different request must not silently replace the first pending
+        # activation.  Its rejection is itself an idempotent mutation receipt.
+        rejections = []
+        for _ in range(2):
+            try:
+                h.control("apply", request_id="pending-plan-b", plan=plan)
+            except RuntimeError as error:
+                rejections.append(str(error))
+        assert len(rejections) == 2 and rejections[0] == rejections[1], rejections
+        assert "already waiting" in rejections[0], rejections
+
+        h.control("stop", request_id="cancel-pending-plan")
+        canceled = []
+        for _ in range(2):
+            try:
+                h.control("apply", request_id="pending-plan-a", plan=plan)
+            except RuntimeError as error:
+                canceled.append(str(error))
+        assert len(canceled) == 2 and canceled[0] == canceled[1], canceled
+        assert "PLAN_CANCELED_BY_STOP" in canceled[0], canceled
+        stopped = h.stop()
+        return {"replacement_rejected_idempotently": True,
+                "original_receipt_canceled_idempotently": True,
+                "final_state": stopped["state"]}
+    case("pending-plan-ownership-and-cancel", pending_plan_ownership_and_cancel)
+
     def storage_error(h):
         h.control("apply", plan=h.make_plan(("mutate",)))
         directory = Path(h.control("status")["directory"])
@@ -272,7 +288,11 @@ def run():
                 if status["storage_error"]:
                     break
                 time.sleep(.05)
-            assert status["storage_error"], status
+            assert status["storage_error"] and status["state"] == "STORAGE_FAILED", status
+            drops = status["admission_window_drops"]
+            h.invoke("mutate")
+            status = h.control("status")
+            assert status["admission_window_drops"] > drops, status
             h.control("stop")
             deadline = time.monotonic() + 5
             while time.monotonic() < deadline:
@@ -284,7 +304,8 @@ def run():
             assert all(not x["owned"] for x in status["hooks"]), status
         finally:
             kernel.CloseHandle(lock)
-        return {"storage_error": status["storage_error"], "hooks_cleaned_independently": True, "clean_seal_not_claimed": True}
+        return {"storage_error": status["storage_error"], "capture_failed_closed": True,
+                "hooks_cleaned_independently": True, "clean_seal_not_claimed": True}
     case("storage-failure-and-cleanup", storage_error)
 
     def crash(h):
@@ -316,6 +337,115 @@ def run():
         assert len(rows) == 2 * calls > 200 and not sum(x["events"] for x in end["loss"])
         return {"elapsed_seconds": time.monotonic()-start, "calls": calls, "events": len(rows), "automatic_stop": False}
     case("no-legacy-duration-or-count-cutoff", duration)
+
+    def double_stop_and_apply_after_stop(h):
+        # Stop is idempotent at the protocol level; a second stop must be a
+        # no-op receipt, and activating a plan mid-drain must be refused with
+        # an explicit error instead of silently activating after the seal.
+        # A blocked frame pins the drain open so the rejection is observable.
+        h.control("apply", plan=h.make_probe_pair_plan(("pair_block",)))
+        h.invoke("pair_block")
+        assert h.control("status")["state"] == "RUNNING"
+        first = h.control("stop")
+        assert first["ok"] and first["completion"] == "query status"
+        assert h.control("status")["state"] == "DRAIN_PENDING"
+        second = h.control("stop")
+        assert second["ok"], second
+        rejected = None
+        try:
+            h.control("apply", plan=h.make_probe_pair_plan(("pair_block",), revision=99))
+        except RuntimeError as error:
+            rejected = str(error)
+        assert rejected and "drain in progress" in rejected, rejected
+        mark_rejected = []
+        for _ in range(2):
+            try:
+                h.control("mark", request_id="rejected-mark-is-idempotent",
+                          label="MUST_NOT_APPEND_AFTER_STOP")
+            except RuntimeError as error:
+                mark_rejected.append(str(error))
+        assert len(mark_rejected) == 2 and mark_rejected[0] == mark_rejected[1] \
+            and "draining/stopped" in mark_rejected[0], mark_rejected
+        h.invoke("release")
+        status = h.stop()
+        assert status["state"] == "STOPPED_CLEAN", status
+        return {"second_stop_ok": True, "apply_after_stop_rejected": rejected,
+                "mark_after_stop_rejected_idempotently": True,
+                "final_state": status["state"]}
+    case("double-stop-and-apply-after-stop", double_stop_and_apply_after_stop)
+
+    def admission_window_counted(h):
+        # Keep the physical listener resident with one accepted invocation,
+        # close admission, then execute the same function again. The second
+        # entry is intentionally not an event, but must be independently
+        # counted with a nonzero QPC range.
+        plan = h.make_probe_pair_plan(("pair_block",), slots=64)
+        h.control("apply", plan=plan)
+        h.invoke("pair_block")
+        h.control("stop")
+        assert h.control("status")["state"] == "DRAIN_PENDING"
+        h.invoke("pair_block")
+        pending = h.control("status")
+        assert pending["admission_window_drops"] >= 1, pending
+        h.invoke("release")
+        status = h.stop()
+        metadata, _ = read_manifest(Path(status["directory"]) / "session.manifest")
+        notes = [row for row in metadata if row.get("kind") == "admission_window"]
+        assert notes and notes[-1]["drops"] >= 1, notes
+        assert 0 < notes[-1]["first_qpc"] <= notes[-1]["last_qpc"], notes[-1]
+        return {"admission_notes": len(notes),
+                "final_drops": status.get("admission_window_drops")}
+    case("admission-window-accounted", admission_window_counted)
+
+    def normal_stop_has_no_hidden_deadline(h):
+        h.control("apply", plan=h.make_probe_pair_plan(("pair_block",)))
+        h.invoke("pair_block")
+        h.control("stop")
+        # This deliberately crosses the removed historical ten-second force
+        # boundary. A normal stop must keep waiting and retain the frame.
+        time.sleep(10.25)
+        pending = h.control("status")
+        assert pending["state"] == "DRAIN_PENDING" and pending["in_flight"] == 1, pending
+        h.invoke("release")
+        stopped = h.stop()
+        assert stopped["state"] == "STOPPED_CLEAN", stopped
+        return {"pending_after_seconds": 10.25, "in_flight": 1,
+                "automatic_force": False, "final_state": stopped["state"]}
+    case("normal-stop-no-hidden-deadline", normal_stop_has_no_hidden_deadline)
+
+    def explicit_force_is_terminal_and_late_paired_exit_safe(h):
+        plan = h.make_probe_pair_plan(("pair_block",))
+        h.control("apply", plan=plan)
+        h.invoke("pair_block")
+        h.control("stop", force=True)
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            forced = h.control("status")
+            if forced["state"] == "STOPPED_FORCED":
+                break
+            time.sleep(.05)
+        assert forced["state"] == "STOPPED_FORCED", forced
+        metadata, errors = read_manifest(Path(forced["directory"]) / "session.manifest")
+        assert not errors, errors
+        assert metadata[-1]["kind"] == "session_end" and metadata[-1]["cleanup"] == "STOPPED_FORCED"
+        coverage = [row for row in metadata if row.get("kind") == "coverage"]
+        assert coverage and all(row["complete"] is False for row in coverage), coverage
+        # The listener and generation intentionally remain resident. Returning
+        # through the late paired exit must be safe and must not mutate sealed files.
+        before = [path.read_bytes() for path in sorted(Path(forced["directory"]).glob("*")) if path.is_file()]
+        h.invoke("release")
+        time.sleep(.1)
+        after = [path.read_bytes() for path in sorted(Path(forced["directory"]).glob("*")) if path.is_file()]
+        assert before == after
+        rejected = None
+        try:
+            h.control("apply", plan=plan)
+        except RuntimeError as error:
+            rejected = str(error)
+        assert rejected and "forced session is terminal" in rejected, rejected
+        return {"state": forced["state"], "coverage_complete": False,
+                "late_paired_exit_safe": True, "reactivation_rejected": True}
+    case("explicit-force-terminal-late-paired-exit-safe", explicit_force_is_terminal_and_late_paired_exit_safe)
     print(json.dumps({"report": str(root / "report.json"), "cases": len(results)}), flush=True)
     return 0 if all(r["ok"] for r in results) else 1
 

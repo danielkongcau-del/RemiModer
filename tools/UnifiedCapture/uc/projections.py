@@ -2,13 +2,13 @@
 import json
 from pathlib import Path
 import subprocess
-from .store import decode_chunk, inspect_session, read_manifest
+from .store import decode_chunk_file, inspect_session, read_manifest
 
 def source_events(directory):
     directory = Path(directory)
     inspection = inspect_session(directory)
     for chunk in inspection["chunks"]:
-        _, rows = decode_chunk((directory / chunk["file"]).read_bytes())
+        _, rows = decode_chunk_file(directory / chunk["file"])
         for offset, length, event, blob in rows:
             source = {"file": str((directory / chunk["file"]).resolve()), "sha256": chunk["sha256"],
                       "offset": offset, "length": length, "offset_domain": "decompressed_payload"}
@@ -51,7 +51,10 @@ def legacy_projection(directory, destination, decoder):
     expected = {}
     for row in manifests:
         if row.get("kind") == "plan_activation":
-            for point in row["source"]["points"]:
+            # v2 activations carry observations, not v1 points, and can share
+            # a session with v1 generations. They are irrelevant to the
+            # frozen legacy decoder and must not break this projection.
+            for point in row.get("source", {}).get("points", []):
                 if "legacy_reader" in point:
                     expected[row["generation"], point["id"]] = point["legacy_reader"]["source_digest"]
     count = 0

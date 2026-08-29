@@ -14,9 +14,12 @@
       "required": ["event_slots_per_observation", "call_frames_per_function", "thread_nesting_limit", "max_record_bytes"],
       "properties": {
         "event_slots_per_observation": {"type": "integer", "minimum": 1},
-        "call_frames_per_function": {"type": "integer", "minimum": 1},
-        "thread_nesting_limit": {"type": "integer", "minimum": 1},
-        "max_record_bytes": {"type": "integer", "minimum": 1}
+        "call_frames_per_function": {"type": "integer", "minimum": 1, "maximum": 256,
+          "description": "Maximum simultaneous logical probe-pair frames retained across active observations on one callback thread."},
+        "thread_nesting_limit": {"type": "integer", "minimum": 1, "maximum": 256},
+        "max_record_bytes": {"type": "integer", "minimum": 1},
+        "capture_xmm": {"type": "boolean", "default": true,
+          "description": "False suppresses XMM values from persisted records; records carry xmm_mask=0."}
       }
     },
     "observations": {
@@ -47,7 +50,55 @@
                   "cet_cfg_test": {"enum": ["passed-own-fixture", "target-runtime-required", "target-runtime-observed"]}
                 }
               },
-              "reads": {"type": "array"}
+              "reads": {
+                "description": "Read program executed at the qualified entry or exit callback selected by phase. Phase defaults to enter.",
+                "type": "array",
+                "items": {
+                  "type": "object",
+                  "required": ["id", "base", "evidence"],
+                  "properties": {
+                    "id": {"type": "string", "minLength": 1},
+                    "base": {"description": "Current register, leave-only 'entry:<register>', 'module:<alias>' or the id of an earlier same-phase read.",
+                             "anyOf": [{"enum": ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+                                                  "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip"]},
+                                       {"enum": ["entry:rax", "entry:rbx", "entry:rcx", "entry:rdx", "entry:rsi",
+                                                  "entry:rdi", "entry:rbp", "entry:rsp", "entry:r8", "entry:r9",
+                                                  "entry:r10", "entry:r11", "entry:r12", "entry:r13", "entry:r14",
+                                                  "entry:r15", "entry:rip"]},
+                                       {"type": "string", "pattern": "^module:.+"},
+                                       {"type": "string", "minLength": 1}]},
+                    "offset": {"type": "integer", "minimum": 0},
+                    "phase": {"enum": ["enter", "leave"], "default": "enter"},
+                    "op": {"enum": ["scalar", "relative", "block", "string", "array"], "default": "scalar"},
+                    "width": {"enum": [1, 2, 4, 8], "description": "scalar/relative byte width."},
+                    "size": {"type": "integer", "minimum": 1, "description": "block byte size."},
+                    "max_bytes": {"type": "integer", "minimum": 1, "maximum": 4096,
+                                  "description": "string capacity; NUL must appear within it for status ok."},
+                    "count_from": {"type": "string", "minLength": 1, "description": "earlier scalar read id supplying the array count."},
+                    "stride": {"type": "integer", "minimum": 1},
+                    "max_count": {"type": "integer", "minimum": 1},
+                    "when": {
+                      "type": "object",
+                      "required": ["op", "value"],
+                      "properties": {
+                        "op": {"enum": ["eq", "neq"]},
+                        "value": {"type": "integer", "minimum": 0},
+                        "mask": {"type": "integer", "minimum": 0,
+                                 "description": "raw loaded bits are masked before the comparison."}
+                      },
+                      "description": "Entry-phase predicate on the loaded scalar; non-matching events are filtered and counted (filtered_by_plan), not recorded."
+                    },
+                    "evidence": {"type": "array", "minItems": 1}
+                  },
+                  "allOf": [{
+                    "if": {"required": ["when"]},
+                    "then": {"properties": {"phase": {"const": "enter"}, "op": {"enum": ["scalar", "relative"]}}}
+                  }, {
+                    "if": {"required": ["base"], "properties": {"base": {"pattern": "^entry:"}}},
+                    "then": {"required": ["phase"], "properties": {"phase": {"const": "leave"}}}
+                  }]
+                }
+              }
             }
           },
           "exit_capture_requirement": {"enum": ["none", "completion", "return_value", "path_identity"]},

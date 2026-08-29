@@ -3,7 +3,6 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
-#include <memory>
 #include <span>
 
 namespace uc {
@@ -19,7 +18,8 @@ struct PairFrame {
 enum class PairOpenResult { Opened, CapacityExhausted, TooManyExitHooks, Invalid };
 
 class PairLedger {
-    std::unique_ptr<PairFrame[]> frames;
+    static constexpr size_t MaximumCapacity=256;
+    std::array<PairFrame,MaximumCapacity> frames{};
     size_t capacity=0,count=0;
     bool Matches(const PairFrame& frame,uint32_t hook)const noexcept {
         for(uint32_t i=0;i<frame.exitHookCount;++i)if(frame.exitHooks[i]==hook)return true;
@@ -27,21 +27,20 @@ class PairLedger {
     }
     template<class Predicate>
     size_t Extract(Predicate predicate,std::span<PairFrame> output)noexcept {
-        size_t needed=0;for(size_t i=0;i<count;++i)if(predicate(frames[i]))++needed;
-        // If the caller cannot account for every extracted frame, leave the
-        // ledger untouched: silent truncation would fabricate clean pairing.
-        if(needed>output.size())return SIZE_MAX;
+        // Partial extraction: remove only the frames actually handed to the
+        // caller. Leaving the remainder for the next call keeps in-flight
+        // accounting drainable when matches exceed the batch span, instead of
+        // returning SIZE_MAX and wedging the stop drain forever.
         size_t written=0,kept=0;
         for(size_t i=0;i<count;++i){
-            if(predicate(frames[i])){
-                if(written<output.size())output[written]=frames[i];
-                ++written;
+            if(written<output.size()&&predicate(frames[i])){
+                output[written]=frames[i];++written;
             }else {if(kept!=i)frames[kept]=frames[i];++kept;}
         }
         count=kept;return written;
     }
 public:
-    explicit PairLedger(size_t maximum):frames(maximum?std::make_unique<PairFrame[]>(maximum):nullptr),capacity(maximum){}
+    explicit PairLedger(size_t maximum):capacity(maximum<=MaximumCapacity?maximum:MaximumCapacity){}
     PairOpenResult Open(uint64_t logical,uint64_t generation,uint64_t group,uint64_t invocation,
                         uint64_t rsp,std::span<const uint32_t> exits)noexcept {
         if(!logical||!generation||!group||!invocation||!rsp||exits.empty())return PairOpenResult::Invalid;
@@ -51,6 +50,13 @@ public:
         frame.invocation=invocation;frame.entryRsp=rsp;frame.exitHookCount=(uint32_t)exits.size();
         for(size_t i=0;i<exits.size();++i)frame.exitHooks[i]=exits[i];
         frames[count++]=frame;return PairOpenResult::Opened;
+    }
+    // Drop a frame that was never recorded (entry predicate filtered it).
+    bool Abandon(uint64_t invocation) noexcept {
+        for(size_t i=0;i<count;++i)if(frames[i].invocation==invocation){
+            for(size_t j=i+1;j<count;++j)frames[j-1]=frames[j];
+            --count;return true;}
+        return false;
     }
     // A shared epilogue closes only the most recently entered matching call
     // group, then all logical subscriptions opened by that same physical hit.
@@ -71,6 +77,8 @@ public:
         return 0;
     }
     size_t Size()const noexcept{return count;}
+    size_t GroupCount()const noexcept {size_t groups=0;uint64_t prior=0;
+        for(size_t i=0;i<count;++i)if(frames[i].callGroup!=prior){prior=frames[i].callGroup;++groups;}return groups;}
 };
 
 }

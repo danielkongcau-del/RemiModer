@@ -1,6 +1,7 @@
 """Exercise only our own FixtureHost. No attachment to the game or XXMI."""
 from __future__ import annotations
 import copy
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -12,11 +13,12 @@ import uuid
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from capturectl import request
-from uc.model import digest, validate
+from uc.model import canonical, digest, validate
 from uc.store import decode_chunk, inspect_session
 
 class Host:
     def __init__(self, root, bootstrap_text=None):
+        self.root = Path(root)
         env = os.environ.copy()
         env.pop("UC_FIXTURE_BOOTSTRAP", None)
         if bootstrap_text is not None:
@@ -61,7 +63,7 @@ class Host:
             raise RuntimeError(str(result))
         return result
 
-    def make_plan(self, names=("mutate", "gum", "block", "float", "state", "raise"), revision=17, slots=32):
+    def make_plan(self, names=("mutate", "gum", "float", "state", "raise"), revision=17, slots=32):
         info = self.info
         p = {"schema": "uc.capture-plan.v1", "plan_id": "synthetic-fixture-NOT-game-evidence", "plan_revision": revision,
              "modules": {"fixture": {"image": info["module"], "sha256": info["sha256"]}},
@@ -70,17 +72,95 @@ class Host:
         for name in names:
             target = info["targets"][name]
             point = {"id": name, "module": "fixture", "rva": target["rva"], "expected_prefix": target["expected_prefix"],
-                     "evidence": ["fixture"], "backend": "slot" if target["abi"] else "gum_attach", "reads": []}
+                     "evidence": ["fixture"], "backend": "slot" if target["abi"] else "gum_probe", "reads": []}
             if target["abi"]:
                 point.update(abi=target["abi"], target_module="fixture", target_rva=target["target_rva"])
             base = "arg0" if target["abi"] else "rcx"
-            point["reads"].append({"id": "value", "op": "scalar", "base": base, "width": 8, "evidence": ["fixture"]})
+            read = {"id": "value", "op": "scalar", "base": base, "width": 8, "evidence": ["fixture"]}
+            if not target["abi"]:
+                read["phase"] = "enter"
+            point["reads"].append(read)
             if name == "state":
                 point["reads"].append({"id": "output", "op": "block", "base": "arg3", "size": 40,
                                        "phase": "leave", "evidence": ["fixture"]})
             p["points"].append(point)
         validate(p, verify_sources=True)
         return p
+
+    def make_probe_pair_plan(self, observations=("pair_block",), revision=17, slots=64):
+        """Build a v2 plan for the explicit entry/exit assembly fixtures.
+
+        Items may be operation names or ``(logical_id, operation_name)`` pairs,
+        allowing tests to verify exact physical-site sharing without another
+        plan builder.
+        """
+        definitions = {
+            "pair": ("pair_entry", "pair_exit"),
+            "pair_recursive": ("pair_recursive_entry", "pair_recursive_exit"),
+            "pair_block": ("pair_block_entry", "pair_block_exit"),
+        }
+        normalized = [(item, item) if isinstance(item, str) else tuple(item) for item in observations]
+        if not normalized or any(len(item) != 2 or item[1] not in definitions for item in normalized):
+            raise ValueError("unknown/empty probe-pair fixture observation")
+
+        def patch_contract(probe_rva=None):
+            value = {"backend_build_hash": "23f5185116d83ca7b7c1f2e069f0c590e0bcdfcbd8374543343bcf4075770475",
+                     "redirect_kind": "near", "required_redirect_span": 5, "relocated_span": 5,
+                     "fault_in_relocated_span_test": "passed-own-fixture",
+                     "architectural_rsp_test": "passed-own-fixture", "cet_cfg_test": "target-runtime-required"}
+            if probe_rva is not None:
+                value["probe_rva"] = probe_rva
+            return value
+
+        exit_contract = {"probe_semantics": "pre_instruction", "return_value_stable": True,
+                         "xmm_return_stable": True, "stack_restored": True,
+                         "caller_return_slot_valid": True, "stack_adjust_remaining": 0,
+                         "nonvolatile_restore_remaining": [], "relocation_class": "pure_epilogue",
+                         "exception_neutral_relocation": True, "contract_evidence": ["assembly-fixture"]}
+        functions = []
+        for operation in dict.fromkeys(operation for _, operation in normalized):
+            entry_name, exit_name = definitions[operation]
+            entry, exit_site = self.info["targets"][entry_name], self.info["targets"][exit_name]
+            functions.append({"function_id": operation, "module": "fixture", "entry_rva": entry["rva"],
+                "runtime_functions": [{"runtime_function_role": "primary"}],
+                "normal_exits": [{"exit_site_id": f"{operation}-ret", "terminal_semantics": "normal_return",
+                    "terminal_semantics_verified": True, "probe_candidates": [{"probe_rva": exit_site["rva"],
+                        "expected_bytes": exit_site["expected_prefix"][:10],
+                        "verified_source_prefix": exit_site["expected_prefix"], "incoming_edges_complete": True,
+                        "backend_patch_contract": patch_contract(exit_site["rva"]),
+                        "exit_capture_contract": exit_contract}]}],
+                "terminal_sites": [], "completeness": {"normal_exit_set_complete": True,
+                    "tail_set_complete": True, "cold_fragments_complete": True}})
+        manifest = {"schema": "uc.native-exit-manifest.v1", "status": "three-way-verified",
+                    "backend_capability": {"backend_build_hash": patch_contract()["backend_build_hash"]},
+                    "functions": functions}
+        manifest_path = self.root / "fixture-exit-manifest.json"
+        manifest_path.write_bytes(canonical(manifest))
+        manifest_sha = hashlib.sha256(manifest_path.read_bytes()).hexdigest()
+        plan = {"schema": "uc.capture-plan.v2", "plan_id": "native-probe-pair-fixture",
+                "plan_revision": revision,
+                "modules": {"fixture": {"image": self.info["module"], "sha256": self.info["sha256"]}},
+                "sources": {"fixture": {"path": self.info["module_path"], "sha256": self.info["sha256"]}},
+                "resources": {"event_slots_per_observation": slots, "call_frames_per_function": 16,
+                              "thread_nesting_limit": 64, "max_record_bytes": 256},
+                "physical_site_policy": {"exact_site_sharing": "share-one-listener-multiple-logical-subscriptions",
+                                         "partial_overlap": "reject"}, "observations": []}
+        for logical_id, operation in normalized:
+            entry_name, _ = definitions[operation]
+            target = self.info["targets"][entry_name]
+            reads = [{"id": "receiver", "base": "rcx", "op": "scalar", "width": 8,
+                      "phase": "enter", "evidence": ["fixture"]}]
+            if operation == "pair":
+                reads.append({"id": "receiver-after", "base": "entry:rcx", "op": "scalar", "width": 8,
+                              "phase": "leave", "evidence": ["fixture"]})
+            plan["observations"].append({"id": logical_id, "backend": "gum_function_probe_pair",
+                "module": "fixture", "entry": {"rva": target["rva"],
+                    "expected_prefix": target["expected_prefix"], "backend_patch_contract": patch_contract(),
+                    "reads": reads},
+                "exit_capture_requirement": "return_value",
+                "native_exit_manifest": {"path": str(manifest_path), "sha256": manifest_sha,
+                                         "function_id": operation}, "evidence": ["fixture"]})
+        return plan
 
     def stop(self, timeout=10):
         self.control("stop")
@@ -130,9 +210,7 @@ def main():
         assert host.invoke("float")["value"] == 0x7fc01236
         host.invoke("state")
         assert host.invoke("raise")["caught"]
-        checks.append("original slot/Gum functions, float NaN bits, state output and SEH preserved")
-        host.invoke("block")
-        assert host.control("status")["in_flight"] == 1
+        checks.append("original slot/instruction-probe functions, float NaN bits, state output and SEH preserved")
         second = copy.deepcopy(first)
         second["plan_revision"] = 18
         second["points"][0]["reads"].append({"id": "count", "op": "scalar", "base": "arg0", "offset": 8,
@@ -141,24 +219,19 @@ def main():
         host.invoke("mutate")
         assert host.control("apply", plan=first)["generation"] == 3
         host.invoke("gum")
-        host.control("stop")
-        pending = host.control("status")
-        assert pending["state"] == "DRAIN_PENDING" and pending["in_flight"] == 1
-        host.invoke("release")
         stopped = host.stop()
-        checks.append("17->18->17 generation, old in-flight pin, asynchronous drain and late leave")
+        checks.append("17->18->17 activation generations remain distinct")
         inspection = inspect_session(Path(stopped["directory"]))
         assert inspection["storage_complete"], inspection
         rows = records(stopped["directory"])
-        block = [e for e, _ in rows if e["point"] == "block"]
-        assert len(block) == 2 and {e["generation"] for e in block} == {1}
-        assert {e["kind"] for e in block} == {"enter", "leave"}
         float_events = [e for e, _ in rows if e["point"] == "float"]
         assert float_events[0]["semantic_interpretation"]["validated_argument_bits"][2]["bits"] == 0x7fc01234
         assert float_events[0]["raw_abi"]["register_mask"] == 0
         gum_events = [e for e, _ in rows if e["point"] == "gum"]
-        assert gum_events[0]["raw_abi"]["registers"]["rcx"] == host.info["object"]
-        assert gum_events[0]["raw_abi"]["xmm_mask"] == 65535
+        assert len(gum_events) == 2 and {e["kind"] for e in gum_events} == {"probe"}
+        assert {e["generation"] for e in gum_events} == {1, 3}
+        assert all(e["raw_abi"]["registers"]["rcx"] == host.info["object"] for e in gum_events)
+        assert all(e["raw_abi"]["xmm_mask"] == 65535 for e in gum_events)
         assert all(not item["events"] for item in stopped["loss"])
         checks.append("native compressed chunks independently verified; raw ABI/semantic values separated")
         result = {"ok": True, "checks": checks, "status": stopped, "inspection": inspection,

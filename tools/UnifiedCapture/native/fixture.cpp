@@ -6,7 +6,7 @@ using uc::Json;
 struct State {uint64_t value=10,count=3;unsigned char data[24]{};};
 static State fixtureState;
 static HANDLE releaseEvent=nullptr,enteredEvent=nullptr;
-static std::thread blocked;
+static std::vector<std::thread> blocked;
 static HMODULE dependency=nullptr;
 extern "C" uint64_t PairRuntimeTarget(uint64_t*,uint64_t);
 extern "C" uint64_t PairRuntimeRecursive(uint64_t*,uint32_t);
@@ -48,9 +48,12 @@ extern "C" __declspec(noinline) void FixtureProbe(State* s){__nop();__nop();__no
 int wmain(int argc,wchar_t** argv){
     if(argc!=3){std::cerr<<"FixtureHost <DLL> <output-directory>\n";return 2;}
     SetEnvironmentVariableW(L"UC_OUTPUT_ROOT",argv[2]);wchar_t selected[32768];
-    SetEnvironmentVariableW(L"UC_BOOTSTRAP",GetEnvironmentVariableW(L"UC_FIXTURE_BOOTSTRAP",selected,32768)?selected:L"uc-fixture-no-bootstrap.json");
+    auto selectedSize=GetEnvironmentVariableW(L"UC_FIXTURE_BOOTSTRAP",selected,(DWORD)std::size(selected));
+    if(selectedSize>=std::size(selected))return 4;
+    SetEnvironmentVariableW(L"UC_BOOTSTRAP",selectedSize?selected:L"uc-fixture-no-bootstrap.json");
     auto dll=LoadLibraryW(argv[1]);if(!dll){std::cerr<<"LoadLibrary failed "<<GetLastError();return 3;}
-    auto base=(uint64_t)GetModuleHandleW(nullptr);wchar_t path[32768];GetModuleFileNameW(nullptr,path,32768);
+    auto base=(uint64_t)GetModuleHandleW(nullptr);wchar_t path[32768];auto pathSize=GetModuleFileNameW(nullptr,path,(DWORD)std::size(path));
+    if(!pathSize||pathSize>=std::size(path))return 5;
     Json targets=Json::object();auto add=[&](const char* name,void* address,void* target,const char* abi){
         targets[name]={{"rva",(uint64_t)address-base},{"target_rva",(uint64_t)target-base},
             {"expected_prefix",uc::Hex(target,32)},{"abi",abi}};};
@@ -83,22 +86,22 @@ int wmain(int argc,wchar_t** argv){
         else if(op=="probe"){FixtureProbe(&fixtureState);result={{"ok",true}};}
         else if(op=="pair"){result={{"value",PairRuntimeTarget(&fixtureState.value,cmd.value("add",1ULL))}};}
         else if(op=="pair_recursive"){result={{"value",PairRuntimeRecursive(&fixtureState.value,cmd.value("depth",3U))}};}
-        else if(op=="pair_block"){ResetEvent(releaseEvent);ResetEvent(enteredEvent);blocked=std::thread([](){PairRuntimeBlock(&fixtureState.value);});
+        else if(op=="pair_block"){ResetEvent(releaseEvent);ResetEvent(enteredEvent);blocked.emplace_back([](){PairRuntimeBlock(&fixtureState.value);});
             WaitForSingleObject(enteredEvent,3000);result={{"blocked",true}};}
         else if(op=="stress"){unsigned count=cmd.value("count",5000U),threads=cmd.value("threads",4U);std::vector<std::thread> workers;
             for(unsigned i=0;i<threads;++i)workers.emplace_back([=](){State local;for(unsigned k=0;k<count;++k)mutate(&local,(void*)1);});
             for(auto& worker:workers)worker.join();result={{"calls",count*threads}};}
         else if(op=="raise")result={{"caught",TryRaise()}};
         else if(op=="gum_raise")result={{"caught",TryGumRaise()}};
-        else if(op=="block"){ResetEvent(releaseEvent);ResetEvent(enteredEvent);blocked=std::thread([](){FixtureBlock(&fixtureState);});
+        else if(op=="block"){ResetEvent(releaseEvent);ResetEvent(enteredEvent);blocked.emplace_back([](){FixtureBlock(&fixtureState);});
             WaitForSingleObject(enteredEvent,3000);result={{"blocked",true}};}
-        else if(op=="release"){SetEvent(releaseEvent);if(blocked.joinable())blocked.join();result={{"released",true}};}
+        else if(op=="release"){SetEvent(releaseEvent);for(auto& worker:blocked)if(worker.joinable())worker.join();blocked.clear();result={{"released",true}};}
         else if(op=="conflict"){mutate=FixtureMutate;result={{"changed",true}};}
         else if(op=="load_dependency"){
             auto dependencyPath=uc::fs::path(argv[1]).parent_path()/L"FixtureModule.dll";dependency=LoadLibraryW(dependencyPath.c_str());
             if(!dependency)throw std::runtime_error("fixture dependency load failed");result={{"base",(uint64_t)dependency}};}
         else if(op=="unload_dependency"){if(dependency){FreeLibrary(dependency);dependency=nullptr;}result={{"unloaded",true}};}
-        else if(op=="quit"){SetEvent(releaseEvent);if(blocked.joinable())blocked.join();std::cout<<"{\"quit\":true}"<<std::endl;break;}
+        else if(op=="quit"){SetEvent(releaseEvent);for(auto& worker:blocked)if(worker.joinable())worker.join();blocked.clear();std::cout<<"{\"quit\":true}"<<std::endl;break;}
         else throw std::runtime_error("unknown fixture operation");std::cout<<result.dump()<<std::endl;
     }catch(const std::exception& e){std::cout<<Json({{"error",e.what()}}).dump()<<std::endl;}}
     return 0;

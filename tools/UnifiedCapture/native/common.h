@@ -38,6 +38,7 @@ Bytes ReadFile(const fs::path&);
 void NewFile(const fs::path&, const void*, size_t);
 void AppendFile(const fs::path&, const void*, size_t);
 std::string UniqueId();
+std::string WallClockUtc();
 inline void Require(bool value, const char* message) { if (!value) throw std::runtime_error(message); }
 inline uint64_t U64(const Json& value) {
     Require(value.is_number_integer() && !value.is_boolean(), "expected unsigned integer");

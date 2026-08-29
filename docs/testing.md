@@ -4,12 +4,12 @@ The public test surface uses only owned fixtures and synthetic evidence.
 
 Current local verification:
 
-- 34 generic Python unit tests pass.
-- Native storage and generation integration passes.
-- Resumable single-entry orchestration passes.
+- All 55 generic Python unit tests pass, including CRC32C known-answer and slicing-by-8 vectors, manifest hash-chain tamper detection, immutable finish-attempt sequencing, schema/index migration, and native-matched phase-aware read-program/resource validation.
+- Native storage and generation integration passes, including bounded asynchronous multi-chunk sealing, unique enqueue-time chunk identities, and hash-chained manifests.
+- Native read-program coverage passes: string/array operations, entry-phase predicates, and v2 leave-phase reads through saved entry-register bases, with filtered events accounted in the sealed loss ledger.
+- Resumable single-entry orchestration passes, including WAITING_MODULE activation polling and all-outcome finish persistence.
 - Multi-entry orchestration and mechanical return-address callsite recovery pass.
-- 15 of 16 native robustness cases pass.
-
-The remaining robustness failure is the documented Windows exception-unwind behavior of the function-level Gum attach path. The instruction-probe path passes its corresponding exception case. This failure is retained as a visible capability limit; it is not renamed or treated as a passing result.
+- All 20 native robustness cases pass, covering pending-plan ownership/cancellation, double-stop, apply-after-stop rejection, a real closed-admission callback, no hidden normal-stop deadline, terminal forced-stop/late-paired-exit safety, and independent hook cleanup under storage failure.
+- Function call listeners are not a supported backend. Entry-only observations use instruction probes; verified entry/exit capture uses explicit probe pairs derived from native exit evidence.
 
 Target-specific tests and their output remain local and are not part of the public repository.

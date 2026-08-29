@@ -5,13 +5,15 @@ import argparse
 import json
 from pathlib import Path
 
+from uc.cli import run_main, write_failure
 from uc.model import canonical, file_hash
 from uc.native_manifest import validate_exit_manifest
 from uc.probe_pair import compile_probe_pair
 from uc.site_qualification import validate_site_qualification
 
 
-def run(manifest_path: Path, plan_path: Path, evidence_path: Path, output: Path):
+def run(manifest_path: Path, plan_path: Path, evidence_path: Path, output: Path,
+        exit_requirement: str = "none"):
     if output.exists():
         raise FileExistsError(f"output is immutable: {output}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
@@ -67,7 +69,10 @@ def run(manifest_path: Path, plan_path: Path, evidence_path: Path, output: Path)
             "module": point["module"],
             "entry": {"rva": function["entry_rva"], "expected_prefix": function["entry_expected_prefix"],
                       "backend_patch_contract": result["backend_patch_contract"], "reads": reads},
-            "exit_capture_requirement": "none",
+            # Exit capture is opt-in: the native probe-pair machinery is ready,
+            # but activating exits additionally requires the derived manifest
+            # to carry fully qualified exit candidates (compile enforces it).
+            "exit_capture_requirement": exit_requirement,
             "native_exit_manifest": {"path": str(manifest_path), "sha256": file_hash(manifest_path),
                                      "function_id": point["id"]},
             "evidence": [point["module"] + "-module", "target-qualification"]})
@@ -88,11 +93,12 @@ def run(manifest_path: Path, plan_path: Path, evidence_path: Path, output: Path)
     plan_out.write_bytes(canonical(plan))
     report = {"schema": "uc.entry-qualification-application.v1", "process_bound": True,
         "entry_activation_ready": True, "game_runtime_verified": False,
+        "exit_requirement_requested": exit_requirement,
         "source_plan": {"path": str(plan_path), "sha256": file_hash(plan_path)},
         "qualification_evidence": {"path": str(evidence_path), "sha256": file_hash(evidence_path)},
         "entry_plan": {"path": str(plan_out), "sha256": file_hash(plan_out), "plan_hash": compiled.plan_hash},
         "logical_observations": len(observations), "physical_sites": len(compiled.sites),
-        "exit_probes_activated": False}
+        "exit_probes_activated": exit_requirement != "none"}
     (output / "report.json").write_bytes(canonical(report))
     print(json.dumps({"output": str(output), **report}, ensure_ascii=False))
     return report
@@ -104,5 +110,18 @@ if __name__ == "__main__":
     parser.add_argument("--plan", type=Path, required=True)
     parser.add_argument("--evidence", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
+    parser.add_argument("--exit-requirement", choices=("none", "completion", "return_value", "path_identity"),
+                        default="none",
+                        help="promote observations to probe-pairs with exit capture when the "
+                             "derived manifest carries fully qualified exit candidates")
     args = parser.parse_args()
-    run(args.manifest.resolve(), args.plan.resolve(), args.evidence.resolve(), args.out.resolve())
+    def invoke():
+        try:
+            return run(args.manifest.resolve(), args.plan.resolve(), args.evidence.resolve(),
+                       args.out.resolve(), args.exit_requirement)
+        except Exception as error:
+            write_failure(args.out, "apply_entry_qualification", error,
+                          {"manifest": str(args.manifest), "plan": str(args.plan),
+                           "evidence": str(args.evidence), "exit_requirement": args.exit_requirement})
+            raise
+    run_main(invoke)

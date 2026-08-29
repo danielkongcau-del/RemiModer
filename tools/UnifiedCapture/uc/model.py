@@ -77,7 +77,7 @@ def validate(plan: dict, *, verify_sources=False) -> dict:
             raise ValueError("duplicate/empty point id")
         ids.add(name)
         backend = point["backend"]
-        if backend not in ("slot", "gum_attach", "gum_probe"):
+        if backend not in ("slot", "gum_probe"):
             raise ValueError("unsupported observation backend")
         if point["module"] not in modules:
             raise ValueError("unknown point module")
@@ -143,14 +143,31 @@ def validate(plan: dict, *, verify_sources=False) -> dict:
                     raise ValueError("scalar width")
             elif op == "block":
                 size = uint(read["size"], "block size", (1 << 32) - 1)
+                if not size:
+                    raise ValueError("block size must be nonzero")
+            elif op == "string":
+                size = uint(read["max_bytes"], "string capacity", 4096)
+                if not size:
+                    raise ValueError("string capacity")
             elif op == "array":
                 if read["count_from"] not in available:
                     raise ValueError("array count must refer to earlier read")
-                size = uint(read["stride"], "stride") * uint(read["max_count"], "max_count")
-                if not read["stride"]:
-                    raise ValueError("zero array stride")
+                stride = uint(read["stride"], "stride")
+                max_count = uint(read["max_count"], "max_count")
+                if not stride or not max_count:
+                    raise ValueError("zero array stride/count bound")
+                size = stride * max_count
             else:
                 raise ValueError("unknown read operation")
+            when = read.get("when")
+            if when is not None:
+                if not isinstance(when, dict) or when.get("op") not in ("eq", "neq"):
+                    raise ValueError("predicate op must be eq/neq")
+                uint(when.get("value"), "predicate value")
+                if "mask" in when:
+                    uint(when["mask"], "predicate mask")
+                if op not in ("scalar", "relative") or phase != "enter":
+                    raise ValueError("predicate requires an enter-phase scalar/relative read")
             if not read.get("evidence") or any(item not in sources for item in read["evidence"]):
                 raise ValueError("read operation lacks evidence")
             for dependency in ([base] if base in available else []) + ([read["count_from"]] if op == "array" else []):

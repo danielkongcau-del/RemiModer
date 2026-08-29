@@ -1,6 +1,7 @@
 """Local control and offline evidence commands; never injects a process."""
 from __future__ import annotations
 import argparse
+from collections import defaultdict, deque
 import ctypes
 import json
 import os
@@ -11,9 +12,10 @@ import sys
 import time
 import uuid
 from uc.model import validate, canonical
+from uc.cli import run_main
 from uc.probe_pair import compile_probe_pair
 from uc.site_qualification import validate_site_qualification
-from uc.store import inspect_session, decode_chunk
+from uc.store import inspect_session, decode_chunk_file
 from uc.index import EvidenceIndex
 from uc.projections import execution_graph, legacy_projection
 
@@ -63,34 +65,71 @@ def export_trace(directory, destination):
     freq = header.get("qpc_frequency")
     if not freq:
         raise ValueError("source QPC frequency missing; no guessed clock conversion")
+    enters, leaves, instants = {}, defaultdict(deque), []
+    for chunk in inspection["chunks"]:
+        _, records = decode_chunk_file(Path(directory) / chunk["file"])
+        for _, _, event, _ in records:
+            kind = event.get("kind")
+            if kind not in ("enter", "leave", "probe", "mark"):
+                continue
+            if kind == "enter" and event.get("invocation_id") is not None:
+                key = (event.get("point"), event["invocation_id"], event.get("tid"))
+                if key in enters:
+                    raise ValueError(f"duplicate invocation enter in sealed evidence: {key}")
+                enters[key] = event
+            elif kind == "leave" and event.get("invocation_id") is not None:
+                leaves[(event.get("point"), event["invocation_id"], event.get("tid"))].append(event)
+            else:
+                instants.append(event)
+    durations, unpaired = [], 0
+    for key, enter in enters.items():
+        leave = leaves[key].popleft() if leaves[key] else None
+        if leave is not None and leave["qpc"] >= enter["qpc"]:
+            durations.append((enter, leave))
+        else:
+            unpaired += 1
+            instants.append(enter)
+            if leave is not None:
+                instants.append(leave)
+    unpaired_leaves = sum(len(pending) for pending in leaves.values())
+    for pending in leaves.values():
+        instants.extend(pending)
     with Path(destination).open("x", encoding="utf-8") as stream:
         stream.write('{"traceEvents":[')
         first = True
-        for chunk in inspection["chunks"]:
-            _, records = decode_chunk((Path(directory) / chunk["file"]).read_bytes())
-            for _, _, event, _ in records:
-                kind = event.get("kind")
-                if kind not in ("enter", "leave", "probe", "mark"):
-                    continue
-                row = {"name": event.get("point", kind), "cat": "observed-not-inferred", "pid": header.get("pid", 0),
-                       "tid": event.get("tid", 0), "ts": event["qpc"] * 1_000_000 / freq,
-                       "ph": "i", "s": "t", "args": {"event_id": event["event_id"], "kind": kind,
-                       "generation": event.get("generation"), "invocation_id": event.get("invocation_id")}}
-                # Instant events avoid synthesizing paired durations when data is incomplete.
-                if not first:
-                    stream.write(",")
-                stream.write(json.dumps(row, ensure_ascii=False))
-                first = False
-        for mark in (r for r in manifests if r.get("kind") == "user_mark"):
+        def emit(row):
+            nonlocal first
             if not first:
                 stream.write(",")
-            stream.write(json.dumps({"name": mark["label"], "cat": "user-mark-not-native-semantics", "ph": "i", "s": "g",
-                "pid": header.get("pid", 0), "tid": 0, "ts": mark["qpc"] * 1_000_000 / freq}))
+            stream.write(json.dumps(row, ensure_ascii=False))
             first = False
-        stream.write('],"displayTimeUnit":"ms","sourceInspection":')
+        pid = header.get("pid", 0)
+        for enter, leave in durations:
+            # Paired durations only when both halves were observed; timing is
+            # observed evidence, never reconstructed from unmatched halves.
+            emit({"name": enter.get("point", "enter"), "cat": "observed-paired-duration", "pid": pid,
+                  "tid": enter.get("tid", 0), "ts": enter["qpc"] * 1_000_000 / freq,
+                  "dur": (leave["qpc"] - enter["qpc"]) * 1_000_000 / freq, "ph": "X",
+                  "args": {"event_id": enter["event_id"], "leave_event_id": leave["event_id"],
+                           "generation": enter.get("generation"), "invocation_id": enter.get("invocation_id")}})
+        for event in instants:
+            kind = event.get("kind")
+            emit({"name": event.get("point", kind), "cat": "observed-not-inferred", "pid": pid,
+                  "tid": event.get("tid", 0), "ts": event["qpc"] * 1_000_000 / freq,
+                  "ph": "i", "s": "t", "args": {"event_id": event["event_id"], "kind": kind,
+                  "generation": event.get("generation"), "invocation_id": event.get("invocation_id")}})
+        for mark in (r for r in manifests if r.get("kind") == "user_mark"):
+            emit({"name": mark["label"], "cat": "user-mark-not-native-semantics", "ph": "i", "s": "g",
+                  "pid": pid, "tid": 0, "ts": mark["qpc"] * 1_000_000 / freq})
+        stream.write('],"displayTimeUnit":"ms","pairedDurations":')
+        stream.write(json.dumps({"paired": len(durations), "unpaired_enters": unpaired,
+                                 "unpaired_leaves": unpaired_leaves}))
+        stream.write(',"sourceInspection":')
         stream.write(json.dumps(inspection, ensure_ascii=False))
         stream.write("}")
-    return {"projection": str(destination), "source_mutated": False}
+    return {"projection": str(destination), "source_mutated": False,
+            "paired_durations": len(durations), "unpaired_enters": unpaired,
+            "unpaired_leaves": unpaired_leaves}
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -108,6 +147,9 @@ def main():
             item.add_argument("--out", type=Path, required=True)
         if cmd == "stop":
             item.add_argument("--drain", action="store_true", required=True)
+            item.add_argument("--force", action="store_true",
+                              help="terminal unclean seal for wedged frames; unresolved hooks/resources "
+                                   "remain resident and the process cannot be reactivated")
     item = sub.add_parser("validate")
     item.add_argument("plan", type=Path)
     item.add_argument("--verify-sources", action="store_true")
@@ -179,6 +221,9 @@ def main():
             qualification = json.loads(args.qualification.read_text(encoding="utf-8-sig"))
             validate_site_qualification(qualification)
             fields["qualification"] = qualification
+        fields = dict(fields)
+        if args.cmd == "stop" and args.force:
+            fields["force"] = True
         result = request(args.pid, args.cmd, request_id=args.request_id, **fields)
         if args.cmd == "qualify-sites":
             envelope = {"schema": "uc.target-site-qualification-evidence.v1",
@@ -191,4 +236,4 @@ def main():
         raise SystemExit(1)
 
 if __name__ == "__main__":
-    main()
+    run_main(main)

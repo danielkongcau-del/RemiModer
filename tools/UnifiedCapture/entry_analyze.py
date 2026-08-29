@@ -6,10 +6,11 @@ import json
 from pathlib import Path
 from typing import Any
 
+from uc.cli import run_main
 from uc.caller import entry_return_address, resolve_callsite
 from uc.model import canonical, file_hash
 from uc.native_manifest import NativePE
-from uc.store import decode_chunk, inspect_session, read_manifest
+from uc.store import decode_chunk_file, inspect_session, read_manifest
 
 
 def load(path: Path) -> Any:
@@ -21,10 +22,42 @@ def save_new(path: Path, value: Any) -> None:
         stream.write(canonical(value))
 
 
+def _load_finish(run: Path) -> dict[str, Any]:
+    def order(path: Path):
+        token = path.stem[len("finish-attempt-"):].split("-", 1)[0]
+        return (int(token) if token.isdigit() else -1, path.name)
+    attempts = sorted(run.glob("finish-attempt-*.json"), key=order)
+    if attempts:
+        return load(attempts[-1])
+    final = run / "finish-result.json"
+    if final.exists():
+        return load(final)
+    return {"clean": False, "state": "FINISH_RESULT_MISSING"}
+
+
+def _annotate_observed_target(resolved, binding, bindings_by_point):
+    """When a resolved call target is itself another observed point, say so.
+
+    Direct calls into probed entries are common in game code; naming the
+    observed point closes the caller→callee gap without inferring anything
+    about indirect dispatch.
+    """
+    target_rva = (resolved.get("predecessor_instruction") or {}).get("direct_target_rva")
+    base = binding.get("module_base")
+    if target_rva is None or not isinstance(base, int):
+        return
+    target = base + target_rva
+    for point_id, other in bindings_by_point.items():
+        if other.get("address") == target:
+            resolved["direct_target_is_observed_point"] = point_id
+            return
+
+
 def analyze_run(run: Path, out: Path, ledger_path: Path | None = None) -> dict[str, Any]:
     run, out = run.resolve(), out.resolve()
     intent, activation = load(run / "intent.json"), load(run / "activation-response.json")
-    result, finish = load(run / "result.json"), load(run / "finish-result.json")
+    result = load(run / "result.json")
+    finish = _load_finish(run)
     qualification = load(run / "site-qualification-evidence.json")
     derived_report = load(run / "derived/report.json")
     plan = load(Path(derived_report["entry_plan"]["path"]))
@@ -44,14 +77,16 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None) -> dict[s
             window = [begin, min(ends)]
     all_events = []
     event_blobs: dict[int, bytes] = {}
+    events_by_point: dict[str, list] = {}
     chunks = []
     for chunk in inspection["chunks"]:
         path = session / chunk["file"]
         chunks.append({"path": str(path), "sha256": file_hash(path)})
-        _, rows = decode_chunk(path.read_bytes())
+        _, rows = decode_chunk_file(path)
         for _, _, event, blob in rows:
             all_events.append(event)
             event_blobs[event["event_id"]] = blob
+            events_by_point.setdefault(event.get("point"), []).append(event)
     generation = result["generation"]
     coverage = [row for row in manifest if row.get("kind") == "coverage" and row.get("generation") == generation]
     session_end = next((row for row in reversed(manifest) if row.get("kind") == "session_end"), {})
@@ -88,8 +123,8 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None) -> dict[s
     points = []
     for observation in plan["observations"]:
         point = observation["id"]
-        events = [event for event in all_events if event.get("point") == point
-                  and event.get("generation") == generation
+        events = [event for event in events_by_point.get(point, ())
+                  if event.get("generation") == generation
                   and (window is None or window[0] <= event["qpc"] <= window[1])]
         covered = any(row.get("point") == point and row.get("complete") is True for row in coverage)
         losses = [row for row in loss_rows if row.get("point") == point and row.get("generation") == generation]
@@ -120,6 +155,7 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None) -> dict[s
                 if observed is not None:
                     resolved = resolve_callsite(observed, binding, image)
                     resolved["event_id"] = event["event_id"]
+                    _annotate_observed_target(resolved, binding, bindings_by_point)
                     caller_evidence.append(resolved)
         points.append({"point": point, "function_id": observation["native_exit_manifest"]["function_id"],
             "status": status, "event_count": len(events), "event_ids": [event["event_id"] for event in events],
@@ -170,4 +206,4 @@ if __name__ == "__main__":
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--ledger", type=Path)
     args = parser.parse_args()
-    print(json.dumps(analyze_run(args.run, args.out, args.ledger), ensure_ascii=False))
+    print(json.dumps(run_main(analyze_run, args.run, args.out, args.ledger), ensure_ascii=False))

@@ -6,27 +6,45 @@ import json
 import os
 from pathlib import Path
 import struct
+import threading
 import uuid
+from collections import OrderedDict
 from .model import canonical
 
 MAGIC = b"UCCHNK01"
 PREFIX = struct.Struct("<8sIQ")
 RECORD = struct.Struct("<II")
 
-def _crc_table():
-    table = []
+def _crc_tables():
+    # Slicing-by-8: eight incremental tables so the hot loop consumes a full
+    # uint64 per iteration instead of one byte (~3-4x in CPython, no new deps).
+    base = []
     for value in range(256):
         for _ in range(8):
             value = (value >> 1) ^ (0x82f63b78 if value & 1 else 0)
-        table.append(value)
-    return tuple(table)
+        base.append(value)
+    tables = [tuple(base)]
+    for _ in range(7):
+        prior = tables[-1]
+        tables.append(tuple((prior[i] >> 8) ^ base[prior[i] & 255] for i in range(256)))
+    return tuple(tables)
 
-CRC_TABLE = _crc_table()
+CRC_TABLES = _crc_tables()
 
 def crc32c(data: bytes) -> int:
+    t0, t1, t2, t3, t4, t5, t6, t7 = CRC_TABLES
     value = 0xffffffff
-    for byte in data:
-        value = (value >> 8) ^ CRC_TABLE[(value ^ byte) & 255]
+    length = len(data)
+    offset = 0
+    while length - offset >= 8:
+        word = int.from_bytes(data[offset:offset + 8], "little")
+        low = (value ^ word) & 0xffffffff
+        high = (word >> 32) & 0xffffffff
+        value = (t7[low & 255] ^ t6[(low >> 8) & 255] ^ t5[(low >> 16) & 255] ^ t4[(low >> 24) & 255]
+                 ^ t3[high & 255] ^ t2[(high >> 8) & 255] ^ t1[(high >> 16) & 255] ^ t0[(high >> 24) & 255])
+        offset += 8
+    for byte in data[offset:]:
+        value = (value >> 8) ^ t0[(value ^ byte) & 255]
     return value ^ 0xffffffff
 
 def _xpress(data: bytes, expected=None) -> bytes:
@@ -102,7 +120,48 @@ def encode_chunk(session_id, chunk_id, records, compression="none"):
     encoded = canonical(header)
     return PREFIX.pack(MAGIC, len(encoded), len(data)) + encoded + data, header
 
-def decode_chunk(data, *, max_uncompressed=1024 * 1024 * 1024):
+# A content-keyed cache lets analyzers, indexers and projections share one
+# verified decompression/parse. The file is still read and hashed on every
+# lookup: path/size/mtime alone cannot prove immutable evidence did not change.
+_DECODE_CACHE: "OrderedDict[tuple, tuple]" = OrderedDict()
+_DECODE_CACHE_MAX_BYTES = 256 * 1024 * 1024
+_DECODE_CACHE_BYTES = 0
+_DECODE_CACHE_LOCK = threading.Lock()
+
+def decode_chunk_file(path: Path):
+    """Verified decode of one sealed chunk file, memoized by file content."""
+    global _DECODE_CACHE_BYTES
+    path = Path(path).resolve()
+    data = path.read_bytes()
+    key = (str(path), hashlib.sha256(data).digest())
+    with _DECODE_CACHE_LOCK:
+        cached = _DECODE_CACHE.get(key)
+        if cached is not None:
+            _DECODE_CACHE.move_to_end(key)
+            return cached[0]
+    result = decode_chunk(data)
+    weight = len(data) + result[0]["uncompressed_size"]
+    with _DECODE_CACHE_LOCK:
+        # Another decoder may have completed while this thread was outside the
+        # lock.  Prefer its canonical cached object and do not double-account.
+        cached = _DECODE_CACHE.get(key)
+        if cached is not None:
+            _DECODE_CACHE.move_to_end(key)
+            return cached[0]
+        # A changed sealed path must not retain an older decoded copy
+        # indefinitely.  Cache mutation is serialized; decompression is not.
+        for stale in [item for item in _DECODE_CACHE if item[0] == str(path) and item != key]:
+            _, stale_weight = _DECODE_CACHE.pop(stale)
+            _DECODE_CACHE_BYTES -= stale_weight
+        if weight <= _DECODE_CACHE_MAX_BYTES:
+            while _DECODE_CACHE and _DECODE_CACHE_BYTES + weight > _DECODE_CACHE_MAX_BYTES:
+                _, (_, oldest_weight) = _DECODE_CACHE.popitem(last=False)
+                _DECODE_CACHE_BYTES -= oldest_weight
+            _DECODE_CACHE[key] = (result, weight)
+            _DECODE_CACHE_BYTES += weight
+    return result
+
+def decode_chunk(data, *, max_uncompressed=256 * 1024 * 1024):
     if len(data) < PREFIX.size:
         raise ValueError("truncated chunk prefix")
     magic, header_size, payload_size = PREFIX.unpack_from(data)
@@ -140,18 +199,47 @@ def decode_chunk(data, *, max_uncompressed=1024 * 1024 * 1024):
         raise ValueError("chunk range mismatch")
     return header, events
 
-def append_manifest(path: Path, record: dict):
+GENESIS_CHAIN = "0" * 64
+
+def _chain_envelope(record: dict, prev_sha256: str):
     raw = canonical(record)
-    envelope = canonical({"record": record, "sha256": hashlib.sha256(raw).hexdigest()}) + b"\n"
+    return {"record": record, "sha256": hashlib.sha256(raw).hexdigest(), "prev_sha256": prev_sha256}
+
+def append_manifest(path: Path, record: dict):
+    """Validate the existing manifest and append one hash-chained envelope."""
+    path = Path(path)
+    chain_tail = GENESIS_CHAIN
+    if path.exists():
+        with path.open("rb") as stream:
+            chain_seen = False
+            for number, line in enumerate(stream, 1):
+                if not line.endswith(b"\n"):
+                    raise ValueError(f"manifest:{number}:uncommitted manifest tail")
+                envelope = json.loads(line)
+                digest = envelope["sha256"]
+                if hashlib.sha256(canonical(envelope["record"])).hexdigest() != digest:
+                    raise ValueError(f"manifest:{number}:manifest checksum")
+                declared_prev = envelope.get("prev_sha256")
+                if declared_prev is not None:
+                    if declared_prev != chain_tail:
+                        raise ValueError(f"manifest:{number}:manifest hash chain")
+                    chain_seen = True
+                elif chain_seen:
+                    raise ValueError(f"manifest:{number}:manifest chain discontinued")
+                chain_tail = digest
+    envelope = _chain_envelope(record, chain_tail)
     with path.open("ab") as stream:
-        stream.write(envelope)
+        stream.write(canonical(envelope) + b"\n")
         stream.flush()
         os.fsync(stream.fileno())
+    return envelope["sha256"]
 
 def read_manifest(path: Path):
     records, errors = [], []
     if not path.exists():
         return [], ["manifest_missing"]
+    previous = GENESIS_CHAIN
+    chain_seen = False
     with path.open("rb") as stream:
         for number, line in enumerate(stream, 1):
             try:
@@ -161,6 +249,14 @@ def read_manifest(path: Path):
                 record = envelope["record"]
                 if hashlib.sha256(canonical(record)).hexdigest() != envelope["sha256"]:
                     raise ValueError("manifest checksum")
+                declared_prev = envelope.get("prev_sha256")
+                if declared_prev is not None:
+                    if declared_prev != previous:
+                        raise ValueError("manifest hash chain")
+                    chain_seen = True
+                elif chain_seen:
+                    raise ValueError("manifest chain discontinued")
+                previous = envelope["sha256"]
                 records.append(record)
             except (ValueError, KeyError, TypeError) as error:
                 errors.append(f"manifest:{number}:{error}")

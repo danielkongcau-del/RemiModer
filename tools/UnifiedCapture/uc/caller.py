@@ -62,4 +62,10 @@ def resolve_callsite(return_evidence: dict[str, Any], binding: dict[str, Any], i
     result["callsite_status"] = "OBSERVED_RETURN_ADDRESS_RESOLVES_TO_CALL"
     result["call_kind"] = "direct" if instruction.get("direct_target_rva") is not None else "indirect"
     result["callsite_rva"] = instruction["rva"]
+    if result["call_kind"] == "indirect":
+        # The dynamic target is not recoverable from the instruction alone;
+        # surface the exact operand form so the analyst knows which register
+        # or stack slot carried it at runtime.
+        operands = instruction.get("operands", "")
+        result["indirect_call_site"] = {"operands": operands}
     return result

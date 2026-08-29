@@ -71,10 +71,9 @@ def _patch_contract(value: Any, expected: bytes, name: str) -> tuple[str, int, s
     build_hash = sha(value.get("backend_build_hash"))
     span = uint(value.get("required_redirect_span"), f"{name}.required_redirect_span", 256)
     relocated = uint(value.get("relocated_span"), f"{name}.relocated_span", 256)
-    if not span or relocated < span or len(expected) < span:
+    redirect = value.get("redirect_kind")
+    if (redirect, span) not in (("near", 5), ("far", 16)) or relocated < span or len(expected) < relocated:
         raise ValueError(f"{name}: redirect/relocation span is not covered by expected bytes")
-    if value.get("redirect_kind") not in ("near", "far"):
-        raise ValueError(f"{name}: redirect_kind")
     if value.get("fault_in_relocated_span_test") != "passed-own-fixture":
         raise ValueError(f"{name}: relocated-span fault safety is not qualified")
     if value.get("architectural_rsp_test") != "passed-own-fixture":
@@ -100,24 +99,36 @@ def _verified_source_prefix(value: Any, name: str) -> bytes:
     return result
 
 
-def _validate_reads(reads: Any, sources: dict, max_bytes: int, name: str):
+def _validate_reads(reads: Any, sources: dict, modules: dict, max_bytes: int, name: str):
     if not isinstance(reads, list):
         raise ValueError(f"{name}: reads must be an array")
-    ids: set[str] = set()
-    total = 0
+    ids: dict[str, tuple[str, str]] = {}
+    totals = {"enter": 0, "leave": 0}
     for read in reads:
+        phase = read.get("phase", "enter")
+        if phase not in ("enter", "leave"):
+            raise ValueError(f"{name}: v2 reads must use enter/leave phase")
         rid = read.get("id")
         if not isinstance(rid, str) or not rid or rid in ids:
             raise ValueError(f"{name}: duplicate/empty read id")
-        ids.add(rid)
         refs = read.get("evidence", [])
         if not refs or any(ref not in sources for ref in refs):
             raise ValueError(f"{name}: read lacks existing evidence")
         base = read.get("base")
-        if base not in ("rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
-                        "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip") \
-                and base not in ids:
-            raise ValueError(f"{name}: raw probe read base must be a register or earlier scalar")
+        registers = ("rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp",
+                     "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip")
+        entry_register = isinstance(base, str) and base.startswith("entry:") and base[6:] in registers
+        module_base = isinstance(base, str) and base.startswith("module:") and base[7:] in modules
+        if base not in registers and base not in ids and not entry_register and not module_base:
+            raise ValueError(f"{name}: raw probe read base must be a current/entry register, module or earlier scalar")
+        if entry_register and phase != "leave":
+            raise ValueError(f"{name}: entry register base is leave-phase only")
+        if base in ids:
+            if ids[base][0] not in ("scalar", "relative"):
+                raise ValueError(f"{name}: read dependency must be scalar/relative")
+            if ids[base][1] != phase:
+                raise ValueError(f"{name}: read dependency unavailable at selected phase")
+        uint(read.get("offset", 0), f"{name}.offset")
         op = read.get("op", "scalar")
         if op in ("scalar", "relative"):
             size = uint(read.get("width", 8), f"{name}.width", 8)
@@ -125,11 +136,41 @@ def _validate_reads(reads: Any, sources: dict, max_bytes: int, name: str):
                 raise ValueError(f"{name}: scalar width")
         elif op == "block":
             size = uint(read.get("size"), f"{name}.size", max_bytes)
+            if not size:
+                raise ValueError(f"{name}: block size must be nonzero")
+        elif op == "string":
+            size = uint(read.get("max_bytes"), f"{name}.max_bytes", 4096)
+            if not size:
+                raise ValueError(f"{name}: string capacity")
+        elif op == "array":
+            if read.get("count_from") not in ids:
+                raise ValueError(f"{name}: array count must refer to an earlier read")
+            if ids[read["count_from"]][0] not in ("scalar", "relative"):
+                raise ValueError(f"{name}: array count dependency must be scalar/relative")
+            if ids[read["count_from"]][1] != phase:
+                raise ValueError(f"{name}: array count dependency unavailable at selected phase")
+            stride = uint(read.get("stride"), f"{name}.stride")
+            max_count = uint(read.get("max_count"), f"{name}.max_count")
+            if not stride or not max_count:
+                raise ValueError(f"{name}: zero array stride/count bound")
+            size = stride * max_count
         else:
-            raise ValueError(f"{name}: v2 probe-pair initially supports scalar/relative/block reads")
-        total += size
-        if total > max_bytes:
-            raise ValueError(f"{name}: read program exceeds max_record_bytes")
+            raise ValueError(f"{name}: v2 probe-pair supports scalar/relative/block/string/array reads")
+        when = read.get("when")
+        if when is not None:
+            if not isinstance(when, dict) or when.get("op") not in ("eq", "neq"):
+                raise ValueError(f"{name}: predicate op must be eq/neq")
+            uint(when.get("value"), f"{name}.predicate.value")
+            if "mask" in when:
+                uint(when["mask"], f"{name}.predicate.mask")
+            if op not in ("scalar", "relative") or phase != "enter":
+                raise ValueError(f"{name}: predicate requires an enter-phase scalar/relative read")
+        totals[phase] += size
+        if totals[phase] > max_bytes:
+            raise ValueError(f"{name}: read program exceeds per-phase max_record_bytes")
+        # Register only after validation: a read may never reference itself.
+        ids[rid] = (op, phase)
+    return {phase for phase, total in totals.items() if total}
 
 
 def _eligible_candidate(candidate: dict, requirement: str, build_hash: str, name: str):
@@ -184,9 +225,14 @@ def compile_probe_pair(plan: dict, *, verify_sources: bool = True) -> CompiledPr
             raise ValueError(f"source changed: {source['path']}")
     resources = plan.get("resources", {})
     max_bytes = uint(resources.get("max_record_bytes"), "max_record_bytes", (1 << 32) - 1)
+    if not max_bytes:
+        raise ValueError("max_record_bytes: zero not supported")
     for key in ("event_slots_per_observation", "call_frames_per_function", "thread_nesting_limit"):
         if uint(resources.get(key), key, (1 << 32) - 1) == 0:
             raise ValueError(f"{key}: zero not supported")
+    for key in ("call_frames_per_function", "thread_nesting_limit"):
+        if resources[key] > 256:
+            raise ValueError(f"{key}: native maximum is 256")
     policy = plan.get("physical_site_policy", {})
     if policy.get("exact_site_sharing") != "share-one-listener-multiple-logical-subscriptions" or \
             policy.get("partial_overlap") != "reject":
@@ -216,7 +262,9 @@ def compile_probe_pair(plan: dict, *, verify_sources: bool = True) -> CompiledPr
         entry_expected = _verified_source_prefix(entry.get("expected_prefix"), f"{oid}.entry.expected_prefix")
         build_hash, entry_span, entry_patch_hash = _patch_contract(
             entry.get("backend_patch_contract"), entry_expected, f"{oid}.entry")
-        _validate_reads(entry.get("reads", []), sources, max_bytes, f"{oid}.entry")
+        read_phases = _validate_reads(entry.get("reads", []), sources, modules, max_bytes, f"{oid}.entry")
+        if requirement == "none" and "leave" in read_phases:
+            raise ValueError(f"{oid}: leave read requires an exit capture requirement")
         site_rows.append({"module": module, "rva": entry_rva, "span": entry_span,
                           "expected": entry_expected, "build": build_hash,
                           "patch": entry_patch_hash,
@@ -267,18 +315,20 @@ def compile_probe_pair(plan: dict, *, verify_sources: bool = True) -> CompiledPr
         raise ValueError("observations required")
 
     grouped: dict[tuple, list[LogicalSubscription]] = {}
-    ranges: list[tuple[str, int, int, tuple]] = []
+    # Sort reservations once and check neighbours instead of an O(n^2) scan.
+    # Gum reserves a 16-byte physical window even when the selected redirect
+    # happens to be the 5-byte near form. Ownership overlap must use that
+    # backend reservation, not only the bytes changed in this process run.
+    ordered = sorted({(row["module"], row["rva"], row["rva"] + 16,
+                       (row["module"], row["rva"], row["span"], row["expected"], row["build"], row["patch"]))
+                      for row in site_rows})
+    for index, (module, begin, end, key) in enumerate(ordered[:-1]):
+        next_module, next_begin, _, next_key = ordered[index + 1]
+        if next_module == module and next_begin < end and next_key != key:
+            raise ValueError("partial/mismatched physical probe site overlap")
     for row in site_rows:
         key = (row["module"], row["rva"], row["span"], row["expected"], row["build"], row["patch"])
-        for old_module, old_begin, old_end, old_key in ranges:
-            if old_module != row["module"] or old_end <= row["rva"] or row["rva"] + row["span"] <= old_begin:
-                continue
-            if old_key != key:
-                raise ValueError("partial/mismatched physical probe site overlap")
-        if key not in grouped:
-            ranges.append((row["module"], row["rva"], row["rva"] + row["span"], key))
-            grouped[key] = []
-        grouped[key].append(row["subscription"])
+        grouped.setdefault(key, []).append(row["subscription"])
     sites = tuple(PhysicalProbeSite(module, rva, span, expected, build, patch, tuple(subscriptions))
                   for (module, rva, span, expected, build, patch), subscriptions in
                   sorted(grouped.items(), key=lambda item: (item[0][0], item[0][1], item[0][2])))

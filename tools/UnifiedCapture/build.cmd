@@ -20,11 +20,11 @@ cl /nologo /std:c++20 /utf-8 /O2 /W4 /MT /EHsc %UC_INC% native\fixture.cpp build
 if errorlevel 1 exit /b 1
 cl /nologo /std:c++20 /utf-8 /O2 /W4 /MT /EHsc /LD native\fixture_module.cpp /Fo:build\ /Fe:build\FixtureModule.dll /link /INCREMENTAL:NO
 if errorlevel 1 exit /b 1
-cl /nologo /std:c++20 /utf-8 /O2 /W4 /MT /EHsc /DGUM_STATIC %UC_INC% native\gum_exception_probe.cpp /Fo:build\ /Fe:build\GumExceptionProbe.exe /link /INCREMENTAL:NO /LIBPATH:vendor\gum-17.17.0 frida-gum.lib Dnsapi.lib Iphlpapi.lib Winmm.lib Ws2_32.lib Shlwapi.lib Advapi32.lib Ole32.lib Shell32.lib User32.lib
-if errorlevel 1 exit /b 1
 ml64 /nologo /c /Fo build\probe_pair_fixture.obj native\probe_pair_fixture.asm
 if errorlevel 1 exit /b 1
 cl /nologo /std:c++20 /utf-8 /O2 /W4 /MT /EHsc /DGUM_STATIC %UC_INC% native\probe_pair_probe.cpp build\probe_pair_fixture.obj %UC_COMMON% /Fo:build\ /Fe:build\ProbePairProbe.exe /link /INCREMENTAL:NO /LIBPATH:vendor\gum-17.17.0 frida-gum.lib Bcrypt.lib Cabinet.lib Psapi.lib Dnsapi.lib Iphlpapi.lib Winmm.lib Ws2_32.lib Shlwapi.lib Advapi32.lib Ole32.lib Shell32.lib User32.lib
 if errorlevel 1 exit /b 1
 cl /nologo /std:c++20 /utf-8 /O2 /W4 /MT /EHsc /Inative native\pairing_probe.cpp /Fo:build\ /Fe:build\PairLedgerProbe.exe /link /INCREMENTAL:NO
+if errorlevel 1 exit /b 1
+cl /nologo /std:c++20 /utf-8 /O2 /W4 /MT /EHsc /Ivendor /Inative native\store_probe.cpp %UC_COMMON% native\store.cpp /Fo:build\ /Fe:build\StoreProbe.exe /link /INCREMENTAL:NO Bcrypt.lib Cabinet.lib Psapi.lib
 exit /b %errorlevel%

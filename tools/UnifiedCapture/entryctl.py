@@ -4,11 +4,13 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import time
 import uuid
 
 from capturectl import request
 from d0ctl import finish_capture, save_new
 from p1_apply_entry_qualification import run as apply_entries
+from uc.cli import run_main
 from uc.model import file_hash
 from uc.site_qualification import validate_site_qualification
 
@@ -55,11 +57,27 @@ def prepare_apply(pid: int, qualification_path: Path, manifest_path: Path,
     activation_path = output / "activation-response.json"
     if not activation_path.exists():
         activation = request(pid, "apply", request_id=intended["apply_request_id"], plan=compiled_plan)
+        # WAITING_* parks the plan pending module availability; poll until the
+        # idempotent apply returns a real generation before calling it success.
+        while activation.get("ok") and "generation" not in activation:
+            status = request(pid, "status")
+            if not status.get("waiting_plan") and status.get("bootstrap_error"):
+                raise RuntimeError({"error": "apply failed while waiting for modules",
+                                    "bootstrap_error": status["bootstrap_error"],
+                                    "state": status.get("state")})
+            # Replay the idempotent apply only once the parked plan resolved,
+            # so the retry returns the real receipt instead of the reserved
+            # EXECUTION_UNCERTAIN placeholder.
+            if not status.get("waiting_plan"):
+                activation = request(pid, "apply", request_id=intended["apply_request_id"], plan=compiled_plan)
+                continue
+            time.sleep(.5)
         save_new(activation_path, activation)
     else:
         activation = json.loads(activation_path.read_text(encoding="utf-8-sig"))
-    if not activation.get("ok"):
-        raise RuntimeError(activation)
+    if not activation.get("ok") or "generation" not in activation:
+        raise RuntimeError({"error": "activation did not produce a generation",
+                            "activation": activation})
     armed_path = output / "armed-mark-response.json"
     if not armed_path.exists():
         armed = request(pid, "mark", request_id=intended["armed_mark_request_id"], label=intended["armed_label"])
@@ -96,7 +114,9 @@ if __name__ == "__main__":
     finish.add_argument("--wait-seconds", type=float, default=30.0)
     args = parser.parse_args()
     if args.command == "prepare-apply":
-        prepare_apply(args.pid, args.qualification.resolve(), args.manifest.resolve(),
-                      args.plan.resolve(), args.out.resolve())
+        run_main(prepare_apply, args.pid, args.qualification.resolve(), args.manifest.resolve(),
+                 args.plan.resolve(), args.out.resolve())
     else:
-        finish_capture(args.pid, args.run, args.wait_seconds)
+        result = run_main(finish_capture, args.pid, args.run, args.wait_seconds)
+        if not result.get("clean"):
+            raise SystemExit(1)

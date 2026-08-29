@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import sqlite3
 from .model import canonical, file_hash
-from .store import decode_chunk, inspect_session, read_manifest
+from .store import decode_chunk_file, inspect_session, read_manifest
 
 SCHEMA = """
 PRAGMA foreign_keys=ON;
@@ -17,7 +17,7 @@ CREATE TABLE IF NOT EXISTS events(
  source TEXT NOT NULL REFERENCES artifacts(id), session TEXT NOT NULL, event_id TEXT NOT NULL,
  offset INTEGER NOT NULL, length INTEGER NOT NULL, offset_domain TEXT NOT NULL,
  kind TEXT, qpc TEXT, tid TEXT, point TEXT, generation TEXT, invocation TEXT,
- observed_parent TEXT, metadata TEXT NOT NULL, PRIMARY KEY(source,offset));
+ observed_parent TEXT, reads TEXT, metadata TEXT NOT NULL, PRIMARY KEY(source,offset));
 CREATE INDEX IF NOT EXISTS event_call ON events(session,invocation);
 CREATE INDEX IF NOT EXISTS event_point ON events(session,point,generation,qpc);
 CREATE TABLE IF NOT EXISTS evidence_refs(
@@ -50,6 +50,9 @@ class EvidenceIndex:
     def __init__(self, path):
         self.db = sqlite3.connect(path)
         self.db.executescript(SCHEMA)
+        columns = {row[1] for row in self.db.execute("PRAGMA table_info(events)")}
+        if "reads" not in columns:
+            self.db.execute("ALTER TABLE events ADD COLUMN reads TEXT")
 
     def close(self):
         self.db.commit()
@@ -68,12 +71,19 @@ class EvidenceIndex:
             "kind", "event", "point", "generation", "invocation_id", "callId", "tid", "qpc",
             "beginQpc", "endQpc", "observed_parent", "parent_known", "parent", "phase", "read_failures", "truncated") if key in event}
         small["full_event_is_at_source"] = True
-        self.db.execute("INSERT OR IGNORE INTO events VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)", (
+        # Read results travel with the index row so argument/object queries do
+        # not force a re-decode of every chunk.
+        reads = event.get("reads")
+        self.db.execute("""INSERT OR IGNORE INTO events(
+            source,session,event_id,offset,length,offset_domain,kind,qpc,tid,point,
+            generation,invocation,observed_parent,reads,metadata)
+            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
             artifact, session, event_id, offset, length, domain, event.get("kind", event.get("event")),
             str(event.get("qpc", event.get("beginQpc", ""))), str(event.get("tid", "")),
             event.get("point"), str(event.get("generation", "")),
             str(event.get("invocation_id", event.get("callId", ""))),
-            str(event.get("observed_parent", event.get("parent", ""))), canonical(small).decode()))
+            str(event.get("observed_parent", event.get("parent", ""))),
+            canonical(reads).decode() if reads is not None else None, canonical(small).decode()))
         evidence_id = f"{artifact}:{offset}:{length}"
         self.db.execute("INSERT OR IGNORE INTO evidence_refs VALUES(?,?,?,?,?)",
                         (evidence_id, artifact, offset, length, domain))
@@ -96,7 +106,7 @@ class EvidenceIndex:
         for chunk in inspection["chunks"]:
             path = directory / chunk["file"]
             artifact = self.artifact(path, "uc.chunk.v1")
-            _, events = decode_chunk(path.read_bytes())
+            _, events = decode_chunk_file(path)
             for offset, length, event, _ in events:
                 self.add_event(artifact, session, offset, length, "decompressed_payload", event)
                 count += 1
