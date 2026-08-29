@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "uc.native-callsite-manifest.v1",
+  "type": "object",
+  "required": ["schema", "status", "sources", "targets", "runtime_resolution_contract", "summary"],
+  "properties": {
+    "schema": {"const": "uc.native-callsite-manifest.v1"},
+    "status": {"enum": ["mechanical-candidate", "three-way-verified"]},
+    "sources": {"type": "array", "minItems": 1},
+    "targets": {"type": "array"},
+    "runtime_resolution_contract": {
+      "type": "object",
+      "required": ["entry_rsp_source", "return_address_source", "fixed_subtract_forbidden", "tail_calls_need_terminal_branch_evidence"],
+      "properties": {
+        "entry_rsp_source": {"const": "target-pre-instruction-cpu-context"},
+        "return_address_source": {"const": "safe-read-[entry_rsp]"},
+        "fixed_subtract_forbidden": {"const": true},
+        "tail_calls_need_terminal_branch_evidence": {"const": true}
+      }
+    },
+    "summary": {"type": "object"}
+  }
+}

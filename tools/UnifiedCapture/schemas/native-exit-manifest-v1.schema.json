@@ -1,0 +1,46 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "uc.native-exit-manifest.v1",
+  "type": "object",
+  "required": ["schema", "status", "sources", "backend_capability", "functions", "summary"],
+  "properties": {
+    "schema": {"const": "uc.native-exit-manifest.v1"},
+    "status": {"enum": ["mechanical-candidate", "partially-verified", "three-way-verified"]},
+    "sources": {"type": "array", "minItems": 1},
+    "backend_capability": {
+      "type": "object",
+      "required": ["backend", "backend_build_hash", "redirect_span_is_schema_constant"],
+      "properties": {
+        "backend": {"const": "gum_instruction_probe"},
+        "backend_build_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+        "redirect_span_is_schema_constant": {"const": false}
+      }
+    },
+    "functions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["function_id", "module", "module_sha256", "entry_rva", "runtime_functions", "normal_exits", "terminal_sites", "completeness"],
+        "properties": {
+          "function_id": {"type": "string", "minLength": 1},
+          "module": {"type": "string", "minLength": 1},
+          "module_sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+          "entry_rva": {"type": "integer", "minimum": 0},
+          "runtime_functions": {"type": "array", "minItems": 1},
+          "normal_exits": {"type": "array"},
+          "terminal_sites": {"type": "array"},
+          "completeness": {
+            "type": "object",
+            "required": ["normal_exit_set_complete", "tail_set_complete", "cold_fragments_complete"],
+            "properties": {
+              "normal_exit_set_complete": {"type": "boolean"},
+              "tail_set_complete": {"type": "boolean"},
+              "cold_fragments_complete": {"type": "boolean"}
+            }
+          }
+        }
+      }
+    },
+    "summary": {"type": "object"}
+  }
+}

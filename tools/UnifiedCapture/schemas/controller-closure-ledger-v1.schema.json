@@ -1,0 +1,59 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "uc.controller-closure-ledger.v1",
+  "title": "Source-bound four-axis controller closure ledger",
+  "type": "object",
+  "required": ["schema", "scope", "sources", "claims", "summary", "types"],
+  "properties": {
+    "schema": {"const": "uc.controller-closure-ledger.v1"},
+    "scope": {"type": "string"},
+    "sources": {
+      "type": "object",
+      "additionalProperties": {
+        "type": "object",
+        "required": ["path", "sha256"],
+        "properties": {
+          "path": {"type": "string"},
+          "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "claims": {"type": "object"},
+    "summary": {"type": "object"},
+    "types": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["type", "occurrences", "abilities", "methods", "axes", "fully_closed"],
+        "properties": {
+          "type": {"type": "string"},
+          "role": {"type": ["string", "null"]},
+          "occurrences": {"type": "integer", "minimum": 1},
+          "abilities": {"type": "array", "items": {"type": "string"}},
+          "methods": {"type": "array"},
+          "fully_closed": {"const": false},
+          "axes": {
+            "type": "object",
+            "required": [
+              "raw_serialized_evidence",
+              "native_identity_and_semantics",
+              "dynamic_scheduling",
+              "independent_execution"
+            ],
+            "additionalProperties": {
+              "type": "object",
+              "required": ["status", "bounded_claim", "evidence", "gaps"],
+              "properties": {
+                "status": {"enum": ["CLOSED", "CLOSED_BOUNDED", "PARTIAL", "OPEN", "UNKNOWN"]},
+                "bounded_claim": {"type": "string"},
+                "evidence": {"type": "array"},
+                "gaps": {"type": "array", "items": {"type": "string"}}
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

@@ -1,0 +1,43 @@
+# Local-only game installation and first-party launcher data
+miHoYo Launcher/
+
+# Extracted, captured, decoded, indexed, or mechanically derived evidence
+extracted/
+AudioDump/
+Maps/
+
+# Local source assets and references; never publish from this repository
+Remielle/
+
+# External/local tools and launchers
+AnimeStudio-net9/
+FrameTools/
+
+# Target-specific notes and adapters may contain names, addresses, hashes, or findings
+local-only/
+
+# Retired implementation trees must not be accidentally regenerated into Git
+RemiModerUnity/
+
+# Keep the generic recorder platform only; every other reverse-engineering tool stays local
+tools/*
+!tools/UnifiedCapture/
+
+# Build/editor residue
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.dll
+*.exe
+*.user
+*.suo
+.vs/
+__pycache__/
+*.py[cod]
+
+# OS/editor files
+.DS_Store
+Thumbs.db
+desktop.ini

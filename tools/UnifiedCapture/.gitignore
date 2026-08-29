@@ -1,0 +1,25 @@
+# Downloaded dependencies and generated binaries
+vendor/
+build/
+generated/
+
+# Target-bound plans, baselines, evidence, and test output
+plans/
+baselines/
+test-output/
+verification.json
+
+# Target adapters contain locally derived identifiers and must not be published
+controller_ledger.py
+freeze_v6_baseline.py
+p1_selected_callers.py
+p1_selected_semantics.py
+qualify.py
+stage_a.py
+tests/test_controller_ledger.py
+tests/test_selected_callers.py
+tests/test_selected_semantics.py
+
+# Python residue
+__pycache__/
+*.py[cod]

@@ -1,0 +1,27 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "uc.probe-site-qualification.v1",
+  "type": "object",
+  "required": ["schema", "qualification_id", "modules", "sites"],
+  "properties": {
+    "schema": {"const": "uc.probe-site-qualification.v1"},
+    "qualification_id": {"type": "string", "minLength": 1},
+    "modules": {"type": "object", "minProperties": 1},
+    "sites": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "module", "rva", "verified_source_prefix", "semantic_safe_span", "safe_redirect_spans", "direct_interior_edge_free"],
+        "properties": {
+          "id": {"type": "string", "minLength": 1},
+          "module": {"type": "string", "minLength": 1},
+          "rva": {"type": "integer", "minimum": 0},
+          "verified_source_prefix": {"type": "string", "pattern": "^[0-9a-f]+$", "minLength": 32},
+          "semantic_safe_span": {"type": "integer", "minimum": 16},
+          "safe_redirect_spans": {"type": "array", "items": {"enum": [5, 16]}, "minItems": 2, "maxItems": 2},
+          "direct_interior_edge_free": {"const": true}
+        }
+      }
+    }
+  }
+}
