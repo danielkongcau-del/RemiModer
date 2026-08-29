@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import shutil
 import sys
 import uuid
 
@@ -86,6 +87,19 @@ def main():
         host.invoke("pair_recursive", depth=2)
         stopped = finish_capture(host.info["pid"], run, wait_seconds=5)
         acceptance = analyze_run(run, root / "acceptance")
+        campaign_run = root / "campaign-run"
+        campaign_unit = campaign_run / "units" / "fixture-multi-entry"
+        campaign_unit.mkdir(parents=True)
+        for name in ("site-qualification-evidence.json", "finish-result.json"):
+            shutil.copy2(run / name, campaign_run / name)
+        for name in ("activation-response.json", "result.json"):
+            shutil.copy2(run / name, campaign_unit / name)
+        shutil.copytree(run / "derived", campaign_unit / "derived")
+        campaign_intent = json.loads((run / "intent.json").read_text(encoding="utf-8"))
+        campaign_intent["complete_label"] = campaign_intent.pop("finish_label")
+        (campaign_unit / "intent.json").write_bytes(canonical(campaign_intent))
+        campaign_acceptance = analyze_run(campaign_run, root / "campaign-acceptance",
+                                          unit_id="fixture-multi-entry")
         rows = [event for event, _ in records(stopped["directory"])]
         by_point = {point: [row for row in rows if row["point"] == point]
                     for point in ("pair/entry", "recursive/entry")}
@@ -104,12 +118,16 @@ def main():
             raise AssertionError(acceptance_points["pair"])
         if acceptance_points["recursive"]["resolved_runtime_callsite_count"] != 3:
             raise AssertionError(acceptance_points["recursive"])
+        if not campaign_acceptance["accepted"] or \
+                campaign_acceptance["run"]["unit_path"] != str(campaign_unit.resolve()):
+            raise AssertionError(campaign_acceptance)
         result = {"ok": True, "qualified_sites": orchestration["qualification_sites"],
             "logical_observations": len(plan["observations"]), "physical_sites": len(compiled.sites),
             "generation": orchestration["generation"], "events": sum(map(len, by_point.values())),
             "stopped_clean": stopped["state"] == "STOPPED_CLEAN",
             "entry_evidence_accepted": acceptance["accepted"],
             "aggregated_caller_analysis_accepted": True,
+            "campaign_layout_analysis_accepted": True,
             "runtime_return_address_callsites_resolved": 4,
             "unobserved_point_not_misclassified": True, "game_runtime_verified": False}
     finally:

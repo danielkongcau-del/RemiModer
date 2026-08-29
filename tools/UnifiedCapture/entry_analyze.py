@@ -53,13 +53,52 @@ def _annotate_observed_target(resolved, binding, bindings_by_point):
             return
 
 
-def analyze_run(run: Path, out: Path, ledger_path: Path | None = None) -> dict[str, Any]:
+def _annotate_observed_caller(resolved, binding, bindings_by_point):
+    """Bind a PDATA-owned caller range to observed function entries."""
+    runtime_function = resolved.get("caller_runtime_function") or {}
+    begin, end = runtime_function.get("begin_rva"), runtime_function.get("end_rva")
+    base = binding.get("module_base")
+    if not all(isinstance(value, int) for value in (begin, end, base)):
+        return
+    owners = []
+    for point_id, other in bindings_by_point.items():
+        if other.get("module") != binding.get("module") or not isinstance(other.get("address"), int):
+            continue
+        rva = other["address"] - base
+        if begin <= rva < end:
+            owners.append({"point": point_id, "rva": rva,
+                           "relation": "entry_matches_runtime_function_begin" if rva == begin
+                                       else "entry_inside_runtime_function"})
+    if owners:
+        resolved["caller_runtime_function_observed_points"] = owners
+
+
+def _campaign_unit(run: Path, unit_id: str | None) -> Path:
+    units = run / "units"
+    if not units.is_dir():
+        if unit_id is not None:
+            raise ValueError("--unit is only valid for a campaign run")
+        return run
+    candidates = sorted(path for path in units.iterdir() if path.is_dir())
+    if unit_id is None:
+        if len(candidates) != 1:
+            raise ValueError("campaign has multiple units; select one with --unit")
+        return candidates[0]
+    selected = units / unit_id
+    if selected not in candidates:
+        raise ValueError(f"unknown campaign unit: {unit_id}")
+    return selected
+
+
+def analyze_run(run: Path, out: Path, ledger_path: Path | None = None,
+                unit_id: str | None = None) -> dict[str, Any]:
     run, out = run.resolve(), out.resolve()
-    intent, activation = load(run / "intent.json"), load(run / "activation-response.json")
-    result = load(run / "result.json")
+    unit_run = _campaign_unit(run, unit_id)
+    intent, activation = load(unit_run / "intent.json"), load(unit_run / "activation-response.json")
+    result = load(unit_run / "result.json")
     finish = _load_finish(run)
     qualification = load(run / "site-qualification-evidence.json")
-    derived_report = load(run / "derived/report.json")
+    derived_report = load(unit_run / "derived/report.json")
     plan = load(Path(derived_report["entry_plan"]["path"]))
     session = Path(finish.get("directory") or activation["directory"]).resolve()
     inspection = inspect_session(session)
@@ -69,7 +108,10 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None) -> dict[s
                        and row.get("generation") == result["generation"]]
     marks = [row for row in manifest if row.get("kind") == "user_mark"]
     armed = [row["qpc"] for row in marks if row.get("label") == intent["armed_label"]]
-    completed = [row["qpc"] for row in marks if row.get("label") == intent["finish_label"]]
+    complete_label = intent.get("finish_label") or intent.get("complete_label")
+    if not complete_label:
+        raise ValueError("run intent has no completion label")
+    completed = [row["qpc"] for row in marks if row.get("label") == complete_label]
     window = None
     if armed and completed:
         begin = max(armed);ends = [qpc for qpc in completed if qpc >= begin]
@@ -163,17 +205,34 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None) -> dict[s
             status = "UNKNOWN_RAW_ABI_INCOMPLETE"
         else:
             status = "NOT_OBSERVED_IN_COVERED_WINDOW"
-        caller_evidence = []
+        retention_by_return = {row["entry_return_address"]: row
+                               for row in (retention_generation or {}).get("keys", [])}
+        caller_by_return: dict[int, dict[str, Any]] = {}
         binding = bindings_by_point.get(point)
         image = module_images.get(binding.get("module")) if binding else None
         if binding is not None and image is not None:
             for event in raw_events:
                 observed = entry_return_address(event, event_blobs[event["event_id"]])
                 if observed is not None:
+                    return_address = observed["return_address"]
+                    prior = caller_by_return.get(return_address)
+                    if prior is not None:
+                        if retention_policy:
+                            continue
+                        prior["observation_count"] += 1
+                        prior["first_qpc"] = min(prior["first_qpc"], event["qpc"])
+                        prior["last_qpc"] = max(prior["last_qpc"], event["qpc"])
+                        continue
                     resolved = resolve_callsite(observed, binding, image)
-                    resolved["event_id"] = event["event_id"]
+                    resolved["representative_event_id"] = event["event_id"]
+                    aggregate = retention_by_return.get(return_address)
+                    resolved["observation_count"] = aggregate["count"] if aggregate else 1
+                    resolved["first_qpc"] = aggregate["first_qpc"] if aggregate else event["qpc"]
+                    resolved["last_qpc"] = aggregate["last_qpc"] if aggregate else event["qpc"]
                     _annotate_observed_target(resolved, binding, bindings_by_point)
-                    caller_evidence.append(resolved)
+                    _annotate_observed_caller(resolved, binding, bindings_by_point)
+                    caller_by_return[return_address] = resolved
+        caller_evidence = [caller_by_return[key] for key in sorted(caller_by_return)]
         points.append({"point": point, "function_id": observation["native_exit_manifest"]["function_id"],
             "status": status, "event_count": len(events), "event_ids": [event["event_id"] for event in events],
             "coverage_complete": covered, "lossless": lossless, "raw_abi_complete": raw,
@@ -181,21 +240,42 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None) -> dict[s
             "retention_generation": ({**retention_generation, "scope": "activation_generation",
                 "temporal_event_trace_complete": False} if retention_generation is not None else None),
             "runtime_caller_evidence": caller_evidence,
+            "runtime_call_observation_count": sum(row["observation_count"] for row in caller_evidence),
             "resolved_runtime_callsite_count": sum(
+                row["observation_count"] for row in caller_evidence
+                if row.get("callsite_status") == "OBSERVED_RETURN_ADDRESS_RESOLVES_TO_CALL"),
+            "unique_resolved_runtime_callsite_count": sum(
                 row.get("callsite_status") == "OBSERVED_RETURN_ADDRESS_RESOLVES_TO_CALL"
                 for row in caller_evidence),
         })
+    execution_edges: dict[tuple[str, str], dict[str, Any]] = {}
+    for point in points:
+        for caller in point["runtime_caller_evidence"]:
+            for owner in caller.get("caller_runtime_function_observed_points", []):
+                if owner["relation"] != "entry_matches_runtime_function_begin":
+                    continue
+                key = owner["point"], point["point"]
+                edge = execution_edges.setdefault(key, {"caller_point": key[0], "callee_point": key[1],
+                    "observation_count": 0, "callsite_rvas": [],
+                    "evidence_scope": point["evidence_scope"],
+                    "evidence": "runtime return address + unique predecessor call + PDATA caller ownership"})
+                edge["observation_count"] += caller["observation_count"]
+                edge["callsite_rvas"].append(caller["callsite_rva"])
+    for edge in execution_edges.values():
+        edge["callsite_rvas"] = sorted(set(edge["callsite_rvas"]))
     accepted = all(global_checks.values()) and all(row["status"] in
         ("OBSERVED", "OBSERVED_AGGREGATED_CALLERS", "NOT_OBSERVED_IN_COVERED_WINDOW") for row in points)
     report = {"schema": "uc.entry-evidence-acceptance.v1", "accepted": accepted,
         "game_runtime_verified": accepted and bool(bindings)
             and all(binding.get("module") in ("game", "unity") for binding in bindings),
-        "run": {"path": str(run), "intent_sha256": file_hash(run / "intent.json")},
+        "run": {"path": str(run), "unit_path": str(unit_run),
+                "intent_sha256": file_hash(unit_run / "intent.json")},
         "session": {"path": str(session), "manifest_sha256": file_hash(session / "session.manifest"),
                     "chunks": chunks, "inspection": inspection},
         "unit_id": intent["unit_id"], "generation": generation, "action_window_qpc": window,
         "checks": global_checks,
-        "points": points, "summary": {status: sum(row["status"] == status for row in points)
+        "points": points, "runtime_execution_edges": [execution_edges[key] for key in sorted(execution_edges)],
+        "summary": {status: sum(row["status"] == status for row in points)
             for status in ("OBSERVED", "OBSERVED_AGGREGATED_CALLERS", "NOT_OBSERVED_IN_COVERED_WINDOW", "UNKNOWN", "UNKNOWN_RAW_ABI_INCOMPLETE")},
         "not_proven": ["behavior did not execute", "serialized instance identity", "owner/entity identity",
                        "semantic caller identity", "cross-thread causality", "complete controller"]}
@@ -228,5 +308,6 @@ if __name__ == "__main__":
     parser.add_argument("--run", type=Path, required=True)
     parser.add_argument("--out", type=Path, required=True)
     parser.add_argument("--ledger", type=Path)
+    parser.add_argument("--unit")
     args = parser.parse_args()
-    print(json.dumps(run_main(analyze_run, args.run, args.out, args.ledger), ensure_ascii=False))
+    print(json.dumps(run_main(analyze_run, args.run, args.out, args.ledger, args.unit), ensure_ascii=False))

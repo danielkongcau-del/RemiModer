@@ -11,7 +11,7 @@ UnifiedCapture is a configurable local evidence recorder for Windows x64 process
 - `campaignctl.py` qualifies the union of several entry plans once, then switches their immutable generations in one target process with explicit armed/complete marks.
 - `p1_bind_campaign_callsites.py` binds that campaign to mechanically decoded static callsites while preserving unresolved indirect callers for runtime resolution.
 - `p1_merge_entry_plans.py` and `p1_reframe_campaign.py` change activation-unit granularity without repeating an already exact physical-site qualification.
-- `d0_analyze.py` and `entry_analyze.py` validate sealed sessions without promoting stronger claims than the evidence supports.
+- `d0_analyze.py` and `entry_analyze.py` validate sealed sessions without promoting stronger claims than the evidence supports. `entry_analyze.py` accepts both legacy flat runs and campaign roots (selecting a unit with `--unit` when necessary), deduplicates caller evidence by return address, and emits only mechanically established PDATA-owned execution edges.
 - `tests/` contains generic unit and native-fixture tests.
 
 ## Dependencies and build output
