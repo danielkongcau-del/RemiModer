@@ -20,6 +20,8 @@ UnifiedCapture is a configurable local evidence recorder for Windows x64 process
 
 The library is an observation component, not an injector. Target loading is outside this repository. Mutation hooks, protection changes, and target-specific evidence are outside the public scope.
 
+The local duplex control pipe rejects remote clients, grants access only to the creating Windows user and SYSTEM, and carries a low mandatory label so that a medium-integrity controller owned by the same user can operate an observer loaded by an elevated launcher.
+
 ## Evidence boundaries
 
 Raw ABI evidence and semantic interpretation are distinct. A decoded callsite is not automatically a semantic caller identity. A type identity is not execution evidence. File integrity is not semantic completeness. Unobserved events remain unknown unless the exact observation point had complete, lossless coverage for the stated window.

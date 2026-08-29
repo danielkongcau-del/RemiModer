@@ -69,6 +69,8 @@ Runtime::Runtime(fs::path root):outputRoot(std::move(root)){
 }
 Json Runtime::Capabilities()const{return {{"schema","uc.capabilities.v1"},{"architecture","windows-x64"},{"gum_version","17.17.0"},
     {"observer_file",observerPath},{"observer_sha256",observerSha},
+    {"control_pipe",{{"remote_clients",false},{"dacl","current-user-and-system"},
+        {"mandatory_label","low-no-write-up"},{"cross_integrity_same_user",true}}},
     {"backends",{"slot","gum_probe","gum_function_probe_pair"}},
     {"reads",{"scalar","relative","block","array","string"}},
     {"read_predicates",{"eq","neq"}},{"predicate_phase","enter"},
