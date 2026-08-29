@@ -12,8 +12,20 @@ from uc.probe_pair import compile_probe_pair
 from uc.site_qualification import validate_site_qualification
 
 
+def validate_qualification_scope(requested: dict, observed: dict, expected_ids: set[str],
+                                 allow_qualification_superset: bool):
+    """Validate transport completeness separately from sub-plan selection."""
+    if set(requested) != set(observed):
+        raise ValueError("qualification response does not exactly cover its request")
+    if allow_qualification_superset:
+        if not expected_ids <= set(observed):
+            raise ValueError("qualification result does not cover every source plan entry")
+    elif set(observed) != expected_ids:
+        raise ValueError("qualification result does not exactly cover source plan entries")
+
+
 def run(manifest_path: Path, plan_path: Path, evidence_path: Path, output: Path,
-        exit_requirement: str = "none"):
+        exit_requirement: str = "none", allow_qualification_superset: bool = False):
     if output.exists():
         raise FileExistsError(f"output is immutable: {output}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
@@ -31,8 +43,7 @@ def run(manifest_path: Path, plan_path: Path, evidence_path: Path, output: Path,
     requested = {row["id"]: row for row in request["sites"]}
     observed = {row["id"]: row for row in response["sites"]}
     expected_ids = {point["id"] + "/entry" for point in source_plan["points"]}
-    if set(requested) != set(observed) or set(observed) != expected_ids:
-        raise ValueError("qualification result does not exactly cover source plan entries")
+    validate_qualification_scope(requested, observed, expected_ids, allow_qualification_superset)
     process_identities = []
     for site_id, result in observed.items():
         source = requested[site_id]
@@ -98,6 +109,8 @@ def run(manifest_path: Path, plan_path: Path, evidence_path: Path, output: Path,
         "qualification_evidence": {"path": str(evidence_path), "sha256": file_hash(evidence_path)},
         "entry_plan": {"path": str(plan_out), "sha256": file_hash(plan_out), "plan_hash": compiled.plan_hash},
         "logical_observations": len(observations), "physical_sites": len(compiled.sites),
+        "qualification_sites_total": len(observed), "qualification_sites_used": len(expected_ids),
+        "qualification_superset_accepted": allow_qualification_superset,
         "exit_probes_activated": exit_requirement != "none"}
     (output / "report.json").write_bytes(canonical(report))
     print(json.dumps({"output": str(output), **report}, ensure_ascii=False))
@@ -114,14 +127,17 @@ if __name__ == "__main__":
                         default="none",
                         help="promote observations to probe-pairs with exit capture when the "
                              "derived manifest carries fully qualified exit candidates")
+    parser.add_argument("--allow-qualified-superset", action="store_true",
+                        help="allow one process-bound qualification envelope to cover this plan plus other plans")
     args = parser.parse_args()
     def invoke():
         try:
             return run(args.manifest.resolve(), args.plan.resolve(), args.evidence.resolve(),
-                       args.out.resolve(), args.exit_requirement)
+                       args.out.resolve(), args.exit_requirement, args.allow_qualified_superset)
         except Exception as error:
             write_failure(args.out, "apply_entry_qualification", error,
                           {"manifest": str(args.manifest), "plan": str(args.plan),
-                           "evidence": str(args.evidence), "exit_requirement": args.exit_requirement})
+                           "evidence": str(args.evidence), "exit_requirement": args.exit_requirement,
+                           "allow_qualification_superset": args.allow_qualified_superset})
             raise
     run_main(invoke)

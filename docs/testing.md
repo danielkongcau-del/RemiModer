@@ -4,7 +4,7 @@ The public test surface uses only owned fixtures and synthetic evidence.
 
 Current local verification:
 
-- All 55 generic Python unit tests pass, including CRC32C known-answer and slicing-by-8 vectors, manifest hash-chain tamper detection, immutable finish-attempt sequencing, schema/index migration, and native-matched phase-aware read-program/resource validation.
+- All 59 generic Python unit tests pass, including CRC32C known-answer and slicing-by-8 vectors, manifest hash-chain tamper detection, immutable finish-attempt sequencing, schema/index migration, campaign qualification-scope/source-pruning isolation, and native-matched phase-aware read-program/resource validation.
 - Native storage and generation integration passes, including bounded asynchronous multi-chunk sealing, unique enqueue-time chunk identities, and hash-chained manifests.
 - Native read-program coverage passes: string/array operations, entry-phase predicates, and v2 leave-phase reads through saved entry-register bases, with filtered events accounted in the sealed loss ledger.
 - Resumable single-entry orchestration passes, including WAITING_MODULE activation polling and all-outcome finish persistence.

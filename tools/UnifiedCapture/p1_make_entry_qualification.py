@@ -1,7 +1,12 @@
-"""Create one source-bound target qualification request for a v1 entry-probe plan."""
+"""Create one source-bound target qualification request for v1 entry plans.
+
+Multiple source plans may be supplied.  Their physical entry sites are
+qualified once, while the original plans remain separate activation units.
+"""
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 from collections import defaultdict
 from pathlib import Path
@@ -11,20 +16,46 @@ from uc.native_manifest import NativePE, validate_exit_manifest
 from uc.site_qualification import validate_site_qualification
 
 
-def run(manifest_path: Path, plan_path: Path, output: Path):
+def _plan_paths(value):
+    if isinstance(value, (str, Path)):
+        return [Path(value)]
+    return [Path(path) for path in value]
+
+
+def run(manifest_path: Path, plan_path: Path | list[Path], output: Path):
     if output.exists():
         raise FileExistsError(f"output is immutable: {output}")
     manifest = json.loads(manifest_path.read_text(encoding="utf-8-sig"))
-    plan = json.loads(plan_path.read_text(encoding="utf-8-sig"))
+    plan_paths = [path.resolve() for path in _plan_paths(plan_path)]
+    if not plan_paths:
+        raise ValueError("at least one source entry plan is required")
+    plans = [json.loads(path.read_text(encoding="utf-8-sig")) for path in plan_paths]
     validate_exit_manifest(manifest)
-    if plan.get("schema") != "uc.capture-plan.v1":
-        raise ValueError("source entry plan must be v1")
+    module_contracts = {}
+    points = []
+    point_ids = set()
+    for path, plan in zip(plan_paths, plans):
+        if plan.get("schema") != "uc.capture-plan.v1":
+            raise ValueError(f"{path}: source entry plan must be v1")
+        if not plan.get("points"):
+            raise ValueError(f"{path}: source entry plan has no points")
+        for alias, module in plan.get("modules", {}).items():
+            if alias in module_contracts and module_contracts[alias] != module:
+                raise ValueError(f"{path}: module alias {alias} has a conflicting identity")
+            module_contracts[alias] = module
+        for point in plan["points"]:
+            if point.get("backend") != "gum_probe":
+                raise ValueError(f"{path}:{point.get('id')}: campaign qualification accepts entry probes only")
+            if point["id"] in point_ids:
+                raise ValueError(f"duplicate campaign point id: {point['id']}")
+            point_ids.add(point["id"])
+            points.append(point)
     functions = {row["function_id"]: row for row in manifest["functions"]}
     modules = {row["alias"]: row for row in manifest["sources"] if row.get("kind") == "module"}
     images = {}
     prepared = []
     interiors = defaultdict(set)
-    for point in plan["points"]:
+    for point in points:
         function = functions.get(point["id"])
         if function is None:
             raise ValueError(f"{point['id']}: no matching native manifest function")
@@ -63,20 +94,35 @@ def run(manifest_path: Path, plan_path: Path, output: Path):
             "static_evidence": {"instruction_boundary_span": span, "instructions": instructions,
                 "direct_edge_scan_scope": "all-file-backed-executable-sections",
                 "direct_interior_edges": []}})
+    source_rows = [{"plan_id": plan["plan_id"], "plan_revision": plan["plan_revision"],
+                    "path": str(path), "sha256": file_hash(path)}
+                   for path, plan in zip(plan_paths, plans)]
+    identity = hashlib.sha256(canonical(source_rows)).hexdigest()[:16]
     request = {"schema": "uc.probe-site-qualification.v1",
-        "qualification_id": "entry-plan-" + plan["plan_id"] + "-r" + str(plan["plan_revision"]),
+        "qualification_id": "entry-campaign-" + identity,
         "modules": {alias: {"image": Path(modules[alias]["path"]).name,
-                             "sha256": plan["modules"][alias]["sha256"]}
-                    for alias in sorted({point["module"] for point in plan["points"]})},
+                             "sha256": module_contracts[alias]["sha256"]}
+                    for alias in sorted({point["module"] for point in points})},
         "sites": sites}
     validate_site_qualification(request)
     output.mkdir(parents=True)
     request_path = output / "qualification.json"
     request_path.write_bytes(canonical(request))
-    report = {"schema": "uc.entry-qualification-preparation.v1", "activation_ready": False,
-        "game_runtime_verified": False, "source_plan": {"path": str(plan_path), "sha256": file_hash(plan_path)},
+    campaign = {"schema": "uc.entry-campaign.v1", "campaign_id": request["qualification_id"],
+        "manifest": {"path": str(manifest_path), "sha256": file_hash(manifest_path)},
+        "qualification": {"path": str(request_path), "sha256": file_hash(request_path)},
+        "units": [{"id": row["plan_id"], "order": index + 1,
+                   "source_plan": {"path": row["path"], "sha256": row["sha256"]},
+                   "armed_label": row["plan_id"].upper().replace("-", "_") + "_ARMED",
+                   "complete_label": row["plan_id"].upper().replace("-", "_") + "_COMPLETE"}
+                  for index, row in enumerate(source_rows)]}
+    campaign_path = output / "campaign.json"
+    campaign_path.write_bytes(canonical(campaign))
+    report = {"schema": "uc.entry-qualification-preparation.v2", "activation_ready": False,
+        "game_runtime_verified": False, "source_plans": source_rows,
         "source_manifest": {"path": str(manifest_path), "sha256": file_hash(manifest_path)},
         "request": {"path": str(request_path), "sha256": file_hash(request_path)},
+        "campaign": {"path": str(campaign_path), "sha256": file_hash(campaign_path)},
         "sites": len(sites), "modules": sorted(request["modules"]),
         "remaining_after_qualification": ["target-process patch contracts", "behavior execution",
                                             "type/owner/entity correlation"]}
@@ -88,7 +134,8 @@ def run(manifest_path: Path, plan_path: Path, output: Path):
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--manifest", type=Path, required=True)
-    parser.add_argument("--plan", type=Path, required=True)
+    parser.add_argument("--plan", type=Path, required=True, action="append",
+                        help="repeat to qualify several activation plans in one target-process pass")
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
-    run(args.manifest.resolve(), args.plan.resolve(), args.out.resolve())
+    run(args.manifest.resolve(), [path.resolve() for path in args.plan], args.out.resolve())
