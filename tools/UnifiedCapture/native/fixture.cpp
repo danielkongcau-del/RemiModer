@@ -85,6 +85,8 @@ int wmain(int argc,wchar_t** argv){
         else if(op=="mixed"){result={{"value",FixtureMixed(1.25f,2.5f,{3.5,9})}};}
         else if(op=="probe"){FixtureProbe(&fixtureState);result={{"ok",true}};}
         else if(op=="pair"){result={{"value",PairRuntimeTarget(&fixtureState.value,cmd.value("add",1ULL))}};}
+        else if(op=="pair_stress"){unsigned count=cmd.value("count",10000U);for(unsigned i=0;i<count;++i)PairRuntimeTarget(&fixtureState.value,1);
+            result={{"calls",count},{"value",fixtureState.value}};}
         else if(op=="pair_recursive"){result={{"value",PairRuntimeRecursive(&fixtureState.value,cmd.value("depth",3U))}};}
         else if(op=="pair_block"){ResetEvent(releaseEvent);ResetEvent(enteredEvent);blocked.emplace_back([](){PairRuntimeBlock(&fixtureState.value);});
             WaitForSingleObject(enteredEvent,3000);result={{"blocked",true}};}

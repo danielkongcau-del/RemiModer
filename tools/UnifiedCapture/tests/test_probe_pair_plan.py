@@ -90,6 +90,27 @@ class ProbePairPlanTests(unittest.TestCase):
         self.assertEqual(len(compiled.sites), 1)
         self.assertEqual(compiled.sites[0].subscriptions[0].role, "entry")
 
+    def test_return_address_retention_is_explicit_bounded_and_entry_only(self):
+        value = self.make_plan(requirement="none")
+        value["observations"][0]["retention"] = {
+            "mode": "first_per_entry_return_address", "max_keys": 1024}
+        self.assertEqual(len(compile_probe_pair(value).sites), 1)
+        for capacity, message in ((0, "nonzero power"), (3, "power of two"), (131072, "<= 65536")):
+            broken = copy.deepcopy(value)
+            broken["observations"][0]["retention"]["max_keys"] = capacity
+            with self.subTest(capacity=capacity), self.assertRaisesRegex(ValueError, message):
+                compile_probe_pair(broken)
+        paired = self.make_plan(requirement="completion")
+        paired["observations"][0]["retention"] = value["observations"][0]["retention"]
+        with self.assertRaisesRegex(ValueError, "entry-only"):
+            compile_probe_pair(paired)
+        predicated = copy.deepcopy(value)
+        predicated["observations"][0]["entry"]["reads"] = [{"id": "receiver", "base": "rcx",
+            "op": "scalar", "width": 8, "phase": "enter", "when": {"op": "neq", "value": 0},
+            "evidence": ["fixture"]}]
+        with self.assertRaisesRegex(ValueError, "cannot be combined"):
+            compile_probe_pair(predicated)
+
     def test_partial_overlap_rejected(self):
         value = self.make_plan(2)
         # Near redirects change only five bytes, but Gum owns a 16-byte

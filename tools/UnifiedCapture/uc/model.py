@@ -179,6 +179,16 @@ def validate(plan: dict, *, verify_sources=False) -> dict:
                     raise ValueError("read dependency unavailable at selected phase")
             total += size
             available[rid] = read
+        retention = point.get("retention")
+        if retention is not None:
+            if backend != "gum_probe" or not isinstance(retention, dict) or \
+                    retention.get("mode") != "first_per_entry_return_address":
+                raise ValueError("return-address retention requires an entry-only instruction probe")
+            capacity = uint(retention.get("max_keys"), "retention max_keys", 65536)
+            if not capacity or capacity & (capacity - 1):
+                raise ValueError("retention max_keys must be a nonzero power of two")
+            if any("when" in read for read in point.get("reads", [])):
+                raise ValueError("return-address retention cannot be combined with read predicates")
         if total > resources["max_record_bytes"]:
             raise ValueError("read program exceeds declared record byte budget")
     return {"plan_hash": digest(plan), "points": len(points), "source_count": len(sources),

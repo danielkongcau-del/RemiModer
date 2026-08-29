@@ -31,6 +31,15 @@
           "id": {"type": "string", "minLength": 1},
           "backend": {"const": "gum_function_probe_pair"},
           "module": {"type": "string", "minLength": 1},
+          "retention": {
+            "type": "object",
+            "required": ["mode", "max_keys"],
+            "properties": {
+              "mode": {"const": "first_per_entry_return_address"},
+              "max_keys": {"enum": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]}
+            },
+            "description": "Entry-only evidence policy: retain one full event per observed caller return address and independently count all duplicates."
+          },
           "entry": {
             "type": "object",
             "required": ["rva", "expected_prefix", "backend_patch_contract", "reads"],
@@ -112,7 +121,11 @@
             }
           },
           "evidence": {"type": "array", "minItems": 1}
-        }
+        },
+        "allOf": [{
+          "if": {"required": ["retention"]},
+          "then": {"properties": {"exit_capture_requirement": {"const": "none"}}}
+        }]
       }
     },
     "physical_site_policy": {

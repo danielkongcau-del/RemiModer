@@ -6,6 +6,17 @@ namespace uc {
 namespace {
 constexpr const char* GumBuildHash="23f5185116d83ca7b7c1f2e069f0c590e0bcdfcbd8374543343bcf4075770475";
 
+void CompileRetention(Point& p,const Json& observation){
+    if(!observation.contains("retention"))return;
+    const auto& retention=observation.at("retention");Require(retention.is_object(),"retention must be an object");
+    Require(retention.at("mode")=="first_per_entry_return_address","unsupported retention mode");
+    auto capacity=U64(retention.at("max_keys"));
+    Require(capacity&&capacity<=65536&&(capacity&(capacity-1))==0,"retention max_keys must be a power of two <= 65536");
+    Require(p.backend==Backend::GumProbe&&p.mode==PointMode::Single,"return-address retention requires an entry-only instruction probe");
+    for(const auto& op:p.ops)Require(!op.hasPredicate,"return-address retention cannot be combined with read predicates");
+    p.retention=RetentionMode::FirstPerEntryReturnAddress;p.aggregateCapacity=(uint32_t)capacity;
+}
+
 void CompilePredicate(const Json& read,ReadOp& op){
     if(!read.contains("when"))return;
     const auto& when=read.at("when");Require(when.is_object(),"predicate must be an object");
@@ -119,6 +130,7 @@ std::shared_ptr<Generation> CompileV2(const Json& source){
         p->mode=p->exitRequirement=="none"?PointMode::Single:PointMode::ProbePair;
         CompileProbeReads(*p,entry.value("reads",Json::array()),modules,maxBytes,evidence);
         if(p->mode==PointMode::Single)for(const auto& op:p->ops)Require(op.phase==1,"leave read requires an exit capture requirement");
+        CompileRetention(*p,observation);
         const auto& manifestRef=observation.at("native_exit_manifest");auto manifestPath=Utf8(manifestRef.at("path").get<std::string>());
         Require(FileSha(manifestPath)==manifestRef.at("sha256").get<std::string>(),"native exit manifest hash mismatch");auto manifest=Json::parse(ReadFile(manifestPath));
         Require(manifest.at("schema")=="uc.native-exit-manifest.v1"&&
@@ -152,7 +164,8 @@ std::shared_ptr<Generation> CompileV2(const Json& source){
         p->poolSize=(uint32_t)slots;p->captureXmm=resources.value("capture_xmm",Json(true)).get<bool>();
         gen->bindings.push_back({{"point",p->id},{"address",p->address},{"module",module.alias},{"module_sha256",module.sha},{"module_base",module.base},
             {"module_load_identity",module.loadId},{"backend","gum_function_probe_pair"},{"mode",p->mode==PointMode::Single?"entry-only":"probe-pair"},
-            {"resolved_native_prefix",Hex(p->prefix.data(),p->prefix.size())},{"function_id",p->functionId},{"exit_requirement",p->exitRequirement}});
+            {"resolved_native_prefix",Hex(p->prefix.data(),p->prefix.size())},{"function_id",p->functionId},{"exit_requirement",p->exitRequirement},
+            {"retention",p->retention==RetentionMode::Full?Json("full"):observation.at("retention")}});
         gen->points.push_back(p);
     }
     Require(!gen->points.empty(),"empty observation list");
@@ -177,8 +190,12 @@ void AllocatePools(Generation& gen){
         Require(p->ops.size()<=(MaxPlanPreallocationBytes-per)/(2*sizeof(ReadResult)),"read result preallocation exceeds process safety budget");
         per+=2*(uint64_t)p->ops.size()*sizeof(ReadResult);
         Require(per&&p->poolSize<=(MaxPlanPreallocationBytes-reserved)/per,"combined pool preallocation exceeds process safety budget");
-        reserved+=(uint64_t)p->poolSize*per;}
+        reserved+=(uint64_t)p->poolSize*per;
+        Require((uint64_t)p->aggregateCapacity*sizeof(AggregateSlot)<=MaxPlanPreallocationBytes-reserved,
+            "combined retention preallocation exceeds process safety budget");
+        reserved+=(uint64_t)p->aggregateCapacity*sizeof(AggregateSlot);}
     for(auto& p:gen.points){p->pool=std::make_unique<Cell[]>(p->poolSize);p->freeSlots.store(p->poolSize);
+        if(p->aggregateCapacity)p->aggregates=std::make_unique<AggregateSlot[]>(p->aggregateCapacity);
         for(unsigned i=0;i<p->poolSize;++i)for(auto record:{&p->pool[i].enter,&p->pool[i].leave}){
             record->reads.resize(p->ops.size());record->bytes.resize(p->blobCapacity);}}
 }
@@ -195,7 +212,8 @@ void Loss::Note(uint64_t qpc,uint64_t lost,uint64_t knownBytes,bool unknown,Loss
     l=r.last.load();while(qpc>l&&!r.last.compare_exchange_weak(l,qpc)){}
 }
 Json Loss::Snapshot(const std::string& point,uint64_t generation)const{Json grouped=Json::object();
-    static constexpr const char* names[]={"queue_overflow","read_failure","truncation","storage_failure","frame_termination_unknown"};
+    static constexpr const char* names[]={"queue_overflow","read_failure","truncation","storage_failure","frame_termination_unknown",
+        "retention_key_unavailable","retention_capacity"};
     for(size_t i=0;i<reasons.size();++i){const auto& r=reasons[i];grouped[names[i]]={{"occurrences",r.occurrences.load()},
         {"events",r.events.load()},{"known_bytes",r.bytes.load()},{"unknown_byte_incidents",r.unknownBytes.load()},
         {"first_qpc",r.first.load()==UINT64_MAX?0:r.first.load()},{"last_qpc",r.last.load()}};}
@@ -215,6 +233,27 @@ Cell* Point::Acquire(){
         if(c.state.compare_exchange_strong(free,1)){c.flags.store(0);c.state.store(2,std::memory_order_release);return &c;}}
     freeSlots.fetch_add(1,std::memory_order_release);
     return nullptr;}
+RetentionResult Point::Retain(const Abi& rawAbi,uint64_t qpc) noexcept {
+    if(retention==RetentionMode::Full)return {};
+    aggregateCallbacks.fetch_add(1,std::memory_order_relaxed);
+    uint64_t key=0;
+    if(!(rawAbi.registerMask&(1U<<Rsp))||!rawAbi.regs[Rsp]||!Read(rawAbi.regs[Rsp],&key,sizeof(key))||!key){
+        loss.Note(qpc,1,0,true,LossReason::RetentionKeyUnavailable);return {false,nullptr,0};}
+    // Fixed-capacity open addressing: no allocation or lock is permitted in a
+    // target callback. The table size is compiler-enforced to a power of two.
+    uint64_t hash=key;hash^=hash>>33;hash*=0xff51afd7ed558ccdULL;hash^=hash>>33;
+    for(uint32_t probe=0;probe<aggregateCapacity;++probe){auto& slot=aggregates[(hash+probe)&(aggregateCapacity-1)];
+        uint64_t observed=slot.key.load(std::memory_order_acquire);bool first=false;
+        if(!observed){uint64_t empty=0;if(slot.key.compare_exchange_strong(empty,key,std::memory_order_acq_rel))first=true;
+            else observed=empty;}
+        if(first||observed==key){slot.count.fetch_add(1,std::memory_order_relaxed);
+            auto f=slot.first.load(std::memory_order_relaxed);while(qpc<f&&!slot.first.compare_exchange_weak(f,qpc)){}
+            auto l=slot.last.load(std::memory_order_relaxed);while(qpc>l&&!slot.last.compare_exchange_weak(l,qpc)){}
+            if(!first)aggregateDuplicates.fetch_add(1,std::memory_order_relaxed);
+            uint32_t missing=0;const bool claim=slot.sampleState.compare_exchange_strong(missing,1,std::memory_order_acq_rel);
+            if(!claim)aggregateSuppressed.fetch_add(1,std::memory_order_relaxed);
+            return {claim,&slot,key};}}
+    loss.Note(qpc,1,0,true,LossReason::RetentionCapacity);return {false,nullptr,key};}
 std::shared_ptr<Generation> Compile(const Json& source,const std::function<uint64_t(uint64_t)>& slotResolver){
     std::function<void(const Json&)> numbers=[&](const Json& value){Require(!value.is_number_float(),"CapturePlan uses integer bit patterns, not floating JSON numbers");
         if(value.is_structured())for(const auto& child:value)numbers(child);};numbers(source);
@@ -286,9 +325,11 @@ std::shared_ptr<Generation> Compile(const Json& source,const std::function<uint6
         }
         if(item.contains("legacy_reader"))evidence(item.at("legacy_reader"));ConfigureLegacy(*p,item,modules);
         Require(p->blobCapacity<=maxBytes,"frozen reader exceeds record byte budget");
+        CompileRetention(*p,item);
         p->poolSize=(uint32_t)slots;p->captureXmm=source.at("resources").value("capture_xmm",Json(true)).get<bool>();
         gen->bindings.push_back({{"point",p->id},{"address",p->address},{"target",p->original},{"module",m.alias},
             {"module_sha256",m.sha},{"module_base",m.base},{"module_load_identity",m.loadId},{"backend",backend},
+            {"retention",p->retention==RetentionMode::Full?Json("full"):item.at("retention")},
             {"resolved_native_prefix",Hex(p->prefix.data(),p->prefix.size())},{"target_resolution",item.value("target_resolution","fixed-rva")}});
         gen->points.push_back(p);
     }

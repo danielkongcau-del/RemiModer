@@ -91,6 +91,9 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None) -> dict[s
     coverage = [row for row in manifest if row.get("kind") == "coverage" and row.get("generation") == generation]
     session_end = next((row for row in reversed(manifest) if row.get("kind") == "session_end"), {})
     loss_rows = session_end.get("loss", [])
+    retention_rows = [row.get("retention") for row in manifest
+                      if row.get("kind") in ("retention_summary", "generation_point_retired")
+                      and isinstance(row.get("retention"), dict)]
     clean_store = inspection.get("storage_complete") is True and not manifest_errors \
         and inspection.get("cleanup") == "STOPPED_CLEAN" and finish.get("clean") is True
     qualified_process = qualification.get("response", {}).get("target_process", {})
@@ -131,15 +134,29 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None) -> dict[s
         lossless = len(losses) == 1 and all(losses[0].get(key) == 0 for key in
             ("events", "bytes", "unknown_byte_records", "read_failures", "truncated")) and all(
             value.get("occurrences") == 0 for value in losses[0].get("reasons", {}).values())
-        raw = bool(events) and all(event.get("kind") == "probe"
+        retention_policy = observation.get("retention")
+        all_point_events = [event for event in events_by_point.get(point, ())
+                            if event.get("generation") == generation]
+        raw_events = all_point_events if retention_policy else events
+        retention_generation = next((row for row in reversed(retention_rows)
+                                     if row.get("point") == point and row.get("generation") == generation), None)
+        sample_keys = {event.get("retention_key", {}).get("value") for event in raw_events
+                       if event.get("retention_key", {}).get("kind") == "entry_return_address"}
+        required_keys = {row.get("entry_return_address") for row in (retention_generation or {}).get("keys", [])}
+        raw = bool(raw_events) and all(event.get("kind") == "probe"
             and event.get("raw_abi", {}).get("register_mask") == 131071
             and event.get("raw_abi", {}).get("xmm_mask") == 65535
             and event.get("read_failures") == 0 and event.get("truncated") == 0
             and any(read.get("id") == "raw-entry-stack-window" and read.get("status") == 1
                     and read.get("length") == 128 for read in event.get("reads", []))
-            for event in events)
-        if not clean_store or window is None or not covered or not lossless:
+            for event in raw_events) and (not retention_policy or required_keys <= sample_keys)
+        if not clean_store or window is None or not covered or not lossless or (retention_policy and
+                (retention_generation is None or not retention_generation.get("complete_for_caller_counts"))):
             status = "UNKNOWN"
+        elif retention_policy and retention_generation["callbacks"] and raw:
+            status = "OBSERVED_AGGREGATED_CALLERS"
+        elif retention_policy and retention_generation["callbacks"]:
+            status = "UNKNOWN_RAW_ABI_INCOMPLETE"
         elif events and raw:
             status = "OBSERVED"
         elif events:
@@ -150,7 +167,7 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None) -> dict[s
         binding = bindings_by_point.get(point)
         image = module_images.get(binding.get("module")) if binding else None
         if binding is not None and image is not None:
-            for event in events:
+            for event in raw_events:
                 observed = entry_return_address(event, event_blobs[event["event_id"]])
                 if observed is not None:
                     resolved = resolve_callsite(observed, binding, image)
@@ -160,13 +177,16 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None) -> dict[s
         points.append({"point": point, "function_id": observation["native_exit_manifest"]["function_id"],
             "status": status, "event_count": len(events), "event_ids": [event["event_id"] for event in events],
             "coverage_complete": covered, "lossless": lossless, "raw_abi_complete": raw,
+            "evidence_scope": "activation_generation" if retention_policy else "marked_window",
+            "retention_generation": ({**retention_generation, "scope": "activation_generation",
+                "temporal_event_trace_complete": False} if retention_generation is not None else None),
             "runtime_caller_evidence": caller_evidence,
             "resolved_runtime_callsite_count": sum(
                 row.get("callsite_status") == "OBSERVED_RETURN_ADDRESS_RESOLVES_TO_CALL"
                 for row in caller_evidence),
         })
     accepted = all(global_checks.values()) and all(row["status"] in
-        ("OBSERVED", "NOT_OBSERVED_IN_COVERED_WINDOW") for row in points)
+        ("OBSERVED", "OBSERVED_AGGREGATED_CALLERS", "NOT_OBSERVED_IN_COVERED_WINDOW") for row in points)
     report = {"schema": "uc.entry-evidence-acceptance.v1", "accepted": accepted,
         "game_runtime_verified": accepted and bool(bindings)
             and all(binding.get("module") in ("game", "unity") for binding in bindings),
@@ -176,7 +196,7 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None) -> dict[s
         "unit_id": intent["unit_id"], "generation": generation, "action_window_qpc": window,
         "checks": global_checks,
         "points": points, "summary": {status: sum(row["status"] == status for row in points)
-            for status in ("OBSERVED", "NOT_OBSERVED_IN_COVERED_WINDOW", "UNKNOWN", "UNKNOWN_RAW_ABI_INCOMPLETE")},
+            for status in ("OBSERVED", "OBSERVED_AGGREGATED_CALLERS", "NOT_OBSERVED_IN_COVERED_WINDOW", "UNKNOWN", "UNKNOWN_RAW_ABI_INCOMPLETE")},
         "not_proven": ["behavior did not execute", "serialized instance identity", "owner/entity identity",
                        "semantic caller identity", "cross-thread causality", "complete controller"]}
     out.mkdir(parents=True, exist_ok=False)
@@ -187,9 +207,12 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None) -> dict[s
         updates = []
         for row in points:
             type_name = row["function_id"].split(".", 1)[0]
-            if row["status"] == "OBSERVED" and type_name in known:
+            if row["status"] in ("OBSERVED", "OBSERVED_AGGREGATED_CALLERS") and type_name in known:
+                bounded_claim = ("The native entry had one or more callers during this complete, lossless activation generation; "
+                    "the aggregate does not prove marked-window timing." if row["status"] == "OBSERVED_AGGREGATED_CALLERS" else
+                    "The native entry was observed inside this complete, lossless marked window.")
                 updates.append({"type": type_name, "axis": "dynamic_scheduling", "status": "PARTIAL",
-                    "bounded_claim": "The native entry was observed inside this complete, lossless marked window.",
+                    "bounded_claim": bounded_claim,
                     "point": row["point"], "does_not_promote": report["not_proven"]})
         overlay = {"schema": "uc.controller-closure-ledger-overlay.v1",
             "base": {"path": str(ledger_path), "sha256": file_hash(ledger_path)},

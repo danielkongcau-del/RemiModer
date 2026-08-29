@@ -31,7 +31,7 @@ void Parent(uint64_t id,uint64_t sp,uint64_t& parent,bool& known,bool push){
     if(push&&known)nesting.rows[nesting.count++]={id,sp};
 }
 void Pop(uint64_t id){for(unsigned i=nesting.count;i>0;--i)if(nesting.rows[i-1].id==id){nesting.count=i-1;break;}}
-void OnProbe(GumInvocationContext* ic,gpointer data){auto& h=*(Hook*)data;Runtime::instance->Probe(h,GumAbi(ic));}
+void OnProbe(GumInvocationContext* ic,gpointer data){auto& h=*(Hook*)data;Runtime::instance->Probe(h,ic);}
 struct SwapResult {bool changed=false,protectionRestored=true;};
 SwapResult Swap(uint64_t address,void* expected,void* value){DWORD old=0;
     if(!VirtualProtect((void*)address,8,PAGE_READWRITE,&old))return {};
@@ -48,13 +48,13 @@ struct ModuleRef {
 };
 bool ModulesLive(const Generation& generation) noexcept;
 }
-Abi GumAbi(GumInvocationContext* ic){Abi a;auto* c=ic->cpu_context;if(!c)return a;
+Abi GumAbi(GumInvocationContext* ic,bool captureXmm){Abi a;auto* c=ic->cpu_context;if(!c)return a;
     uint64_t values[]={c->rax,c->rbx,c->rcx,c->rdx,c->rsi,c->rdi,c->rbp,c->rsp,c->r8,c->r9,c->r10,c->r11,c->r12,c->r13,c->r14,c->r15,c->rip};
     std::memcpy(a.regs,values,sizeof(values));a.registerMask=(1U<<RegCount)-1;a.stackMarker=c->rsp;
-    // Snapshot the backend context before selecting a logical generation.
-    // Individual points may suppress XMM in Capture(), but a global plan flag
-    // must never make a late exit use another generation's ABI policy.
-    if(c->xmm&&Read((uint64_t)c->xmm,a.xmm,sizeof(a.xmm)))a.xmmMask=0xffff;
+    // GPRs are always copied immediately. Probe() defers XMM until a logical
+    // observation actually retains the callback; paired exits request it
+    // before the invocation context expires.
+    if(captureXmm&&c->xmm&&Read((uint64_t)c->xmm,a.xmm,sizeof(a.xmm)))a.xmmMask=0xffff;
     // No inferred arg[]: raw-only hooks stay raw-only even if Ghidra has a prototype.
     return a;}
 Runtime::Runtime(fs::path root):outputRoot(std::move(root)){
@@ -74,7 +74,9 @@ Json Runtime::Capabilities()const{return {{"schema","uc.capabilities.v1"},{"arch
     {"backends",{"slot","gum_probe","gum_function_probe_pair"}},
     {"reads",{"scalar","relative","block","array","string"}},
     {"read_predicates",{"eq","neq"}},{"predicate_phase","enter"},
-    {"plan_resource_capture_xmm",true},{"admission_window_accounting",true},{"forced_stop",true},
+    {"plan_resource_capture_xmm",true},{"retention_modes",{"full","first_per_entry_return_address"}},
+    {"retention_accounting","independent-cumulative-per-key"},{"retention_xmm_capture","retained-full-samples-only"},
+    {"admission_window_accounting",true},{"forced_stop",true},
     {"probe_pair_tls_frame_capacity",256},{"storage_backpressure","nonblocking-bounded-loss-accounted"},
     {"gum_raw_registers",RegNames},{"gum_xmm_registers",16},{"legacy_raw_registers",0},
     {"legacy_abi_values",true},{"legacy_targets_per_process",64},{"ancestry_annotation_depth",256},
@@ -366,14 +368,17 @@ void Runtime::Begin(Hook& h,const Abi& abi,Token& token) noexcept {
     else p.loss.Note(Clock(),1,0,true);
     hot.entrants.fetch_sub(1);
 }
-void Runtime::Probe(Hook& h,const Abi& abi) noexcept {
+void Runtime::Probe(Hook& h,GumInvocationContext* context) noexcept {
+    Abi abi=GumAbi(context,false);bool xmmCaptured=false;
+    auto captureXmm=[&](){if(!xmmCaptured){auto full=GumAbi(context,true);std::memcpy(abi.xmm,full.xmm,sizeof(abi.xmm));
+        abi.xmmMask=full.xmmMask;xmmCaptured=true;}};
     hot.entrants.fetch_add(1);
     auto finish=[&](const PairFrame& frame,bool absent){auto* payload=pairs.Find(frame.invocation);if(!payload)return;
         auto gen=payload->generation;auto& p=*payload->point;
         if(gen->reclaimed.load(std::memory_order_acquire)){
             for(uint32_t i=0;i<payload->exitHookCount;++i)payload->exitHooks[i]->executing.fetch_sub(1);
             pairs.Release(*payload);return;}
-        if(payload->cell){auto& e=payload->cell->leave;e.id=hot.eventIds.fetch_add(1);e.invocation=frame.invocation;
+        if(payload->cell){if(p.captureXmm)captureXmm();auto& e=payload->cell->leave;e.id=hot.eventIds.fetch_add(1);e.invocation=frame.invocation;
             e.parent=payload->cell->enter.parent;e.parentKnown=payload->cell->enter.parentKnown;e.exitHookId=absent?UINT32_MAX:h.id;
             if(absent){e.abi=abi;e.qpc=Clock();e.endQpc=e.qpc;e.tid=GetCurrentThreadId();e.used=0;e.exceptional=false;
                 for(auto& read:e.reads)read={};payload->cell->flags.fetch_or(2|16|32,std::memory_order_release);}
@@ -401,11 +406,17 @@ void Runtime::Probe(Hook& h,const Abi& abi) noexcept {
     for(const auto& point:gen->byHook[h.id]){auto& p=*point;
         if(h.id!=p.hookId)continue; // Exit subscriptions were handled above.
         if(p.mode==PointMode::Single){Token token;token.probe=true;token.generation=gen;token.point=&p;
+            auto retained=p.Retain(abi,Clock());if(!retained.retain)continue;
+            if(p.captureXmm)captureXmm();
             const_cast<Generation*>(gen.get())->inFlight.fetch_add(1);p.inFlight.fetch_add(1);token.cell=p.Acquire();const uint64_t id=hot.eventIds.fetch_add(1);
             if(token.cell){auto& e=token.cell->enter;e.id=id;e.invocation=0;e.parent=0;e.parentKnown=false;
-                if(Capture(p,e,abi,abi,1))token.cell->flags.fetch_or(1|8|16,std::memory_order_release);
-                else{token.cell->state.store(0,std::memory_order_release);p.freeSlots.fetch_add(1,std::memory_order_release);token.cell=nullptr;}}
-            else p.loss.Note(Clock(),1,0,true);
+                e.retentionKey=retained.key;
+                if(Capture(p,e,abi,abi,1)){token.cell->flags.fetch_or(1|8|16,std::memory_order_release);
+                    if(retained.slot){retained.slot->fullRecords.fetch_add(1,std::memory_order_relaxed);
+                        retained.slot->sampleState.store(2,std::memory_order_release);}}
+                else{if(retained.slot)retained.slot->sampleState.store(0,std::memory_order_release);
+                    token.cell->state.store(0,std::memory_order_release);p.freeSlots.fetch_add(1,std::memory_order_release);token.cell=nullptr;}}
+            else {if(retained.slot)retained.slot->sampleState.store(0,std::memory_order_release);p.loss.Note(Clock(),1,0,true);}
             p.inFlight.fetch_sub(1);const_cast<Generation*>(gen.get())->inFlight.fetch_sub(1);continue;}
         if(!pairCapacity){p.loss.Note(Clock(),2,0,true);continue;}
         const uint64_t invocation=hot.callIds.fetch_add(1);auto* payload=pairs.Reserve(invocation);
@@ -418,7 +429,7 @@ void Runtime::Probe(Hook& h,const Abi& abi) noexcept {
         payload->generation=gen;payload->point=&p;payload->cell=p.Acquire();payload->exitHookCount=(uint32_t)p.exits.size();
         p.inFlight.fetch_add(1);const_cast<Generation*>(gen.get())->inFlight.fetch_add(1);
         for(size_t i=0;i<p.exits.size();++i){payload->exitHooks[i]=(Hook*)p.exits[i].runtimeHook;payload->exitHooks[i]->executing.fetch_add(1);}
-        if(payload->cell){auto& e=payload->cell->enter;e.id=hot.eventIds.fetch_add(1);e.invocation=invocation;e.parent=parent;e.parentKnown=parent!=0;
+        if(payload->cell){if(p.captureXmm)captureXmm();auto& e=payload->cell->enter;e.id=hot.eventIds.fetch_add(1);e.invocation=invocation;e.parent=parent;e.parentKnown=parent!=0;
             if(Capture(p,e,abi,abi,1))payload->cell->flags.fetch_or(1,std::memory_order_release);
             else{
                 // Entry predicate filtered this call: undo the just-opened
@@ -462,6 +473,7 @@ void Runtime::WriteRecord(const Generation& gen,Point& point,const Record& e,con
         {"semantic_interpretation",{{"version",point.backend==Backend::Slot?"uc.legacy-abi.v1":"uc.raw-only.v1"},
             {"abi",point.abi},{"validated_argument_bits",args},{"source_plan_hash",gen.planHash}}}};
     if(point.backend!=Backend::GumProbe||point.mode==PointMode::ProbePair)event["invocation_id"]=e.invocation;
+    if(e.retentionKey)event["retention_key"]={{"kind","entry_return_address"},{"value",e.retentionKey}};
     if(e.exitHookId!=UINT32_MAX)for(const auto& exit:point.exits)if(exit.hookId==e.exitHookId){
         event["normal_exit"]={{"exit_site_id",exit.id},{"hook_id",e.exitHookId},{"contract",exit.contract}};break;}
     if(e.legacySize){event["legacy_snapshot"]={{"reader",point.legacyReader},{"offset",e.legacyOffset},{"length",e.legacySize},
@@ -482,6 +494,26 @@ void Runtime::ReportLoss(const Generation& gen,Point& p,uint64_t now){
         store->Meta({{"kind","loss_summary"},{"schema","uc.LossSummary.v1"},{"qpc",now},
             {"counting","cumulative-per-point-generation"},{"loss",snapshot}});p.lastReportedLoss=std::move(snapshot);}
 }
+Json Runtime::RetentionSnapshot(const Generation& gen,const Point& p){
+    Json keys=Json::array();uint64_t classified=0;
+    for(uint32_t i=0;i<p.aggregateCapacity;++i){const auto& slot=p.aggregates[i];auto key=slot.key.load(std::memory_order_acquire);
+        if(!key)continue;auto count=slot.count.load(std::memory_order_relaxed);classified+=count;
+        keys.push_back({{"entry_return_address",key},{"count",count},
+            {"first_qpc",slot.first.load()==UINT64_MAX?0:slot.first.load()},{"last_qpc",slot.last.load()},
+            {"full_records_enqueued",slot.fullRecords.load()}});}
+    const auto keyUnavailable=p.loss.reasons[(size_t)LossReason::RetentionKeyUnavailable].events.load();
+    const auto capacityOverflow=p.loss.reasons[(size_t)LossReason::RetentionCapacity].events.load();
+    return {{"point",p.id},{"generation",gen.generation},{"mode",p.retention==RetentionMode::Full?"full":"first_per_entry_return_address"},
+        {"callbacks",p.aggregateCallbacks.load()},{"classified_callbacks",classified},
+        {"duplicate_key_callbacks",p.aggregateDuplicates.load()},{"suppressed_by_policy",p.aggregateSuppressed.load()},
+        {"max_keys",p.aggregateCapacity},{"keys",std::move(keys)},
+        {"retention_key_unavailable",keyUnavailable},{"retention_capacity_overflow",capacityOverflow},
+        {"complete_for_caller_counts",p.retention==RetentionMode::Full||
+            (classified==p.aggregateCallbacks.load()&&keyUnavailable==0&&capacityOverflow==0)}};}
+void Runtime::ReportRetention(const Generation& gen,Point& p,uint64_t now){
+    if(p.retention==RetentionMode::Full)return;auto snapshot=RetentionSnapshot(gen,p);
+    if(snapshot!=p.lastReportedRetention){store->Meta({{"kind","retention_summary"},{"schema","uc.RetentionSummary.v1"},{"qpc",now},
+        {"counting","cumulative-per-point-generation-key"},{"retention",snapshot}});p.lastReportedRetention=std::move(snapshot);}}
 void Runtime::Tick(){
     bool failedStorage=false;{std::lock_guard errorLock(errorMutex);failedStorage=!storageError.empty();}
     std::lock_guard lock(stateMutex);
@@ -543,7 +575,7 @@ void Runtime::Tick(){
             if(empty){Archive(*gen);it=generations.erase(it);}else ++it;}
         uint64_t now=Clock();if(now-flushQpc>=Frequency()){
             store->Flush();Json loss=archivedLoss;for(const auto& gen:generations)for(const auto& p:gen->points){
-                ReportLoss(*gen,*p,now);loss.push_back(PointSnapshot(*gen,*p));}
+                ReportLoss(*gen,*p,now);ReportRetention(*gen,*p,now);loss.push_back(PointSnapshot(*gen,*p));}
             store->Meta({{"kind","loss_checkpoint"},{"qpc",now},{"loss",loss},{"snapshot_atomic",false}});
             ReportAdmissionWindow();flushQpc=now;}
         if(stopRequested.load()&&!clean){
@@ -566,7 +598,7 @@ void Runtime::Tick(){
                     Meta({{"kind","forced_drain_reclaim"},{"generation",g->generation},
                         {"assumed_unwound_frames",frames},{"operator_forced",true},{"qpc",Clock()}});}
                 Json loss=archivedLoss;for(const auto& gen:generations)for(const auto& p:gen->points){
-                    ReportLoss(*gen,*p,Clock());loss.push_back(PointSnapshot(*gen,*p));
+                    ReportLoss(*gen,*p,Clock());ReportRetention(*gen,*p,Clock());loss.push_back(PointSnapshot(*gen,*p));
                     store->Meta({{"kind","coverage"},{"point",p->id},{"generation",gen->generation},
                         {"begin_qpc",p->coverageBegin},{"end_qpc",p->coverageEnd?p->coverageEnd:stopQpc},{"complete",false}});}
                 ReportAdmissionWindow();
@@ -576,7 +608,7 @@ void Runtime::Tick(){
             uint64_t calls=0;for(auto& g:generations)calls+=g->inFlight.load();bool released=hot.entrants.load()==0&&calls==0;
             for(auto& h:hooks){if(h->owned||h->conflict||h->executing.load())released=false;
                 if(h->listener&&h->detached&&!gum_interceptor_flush_listener(interceptor,h->listener))released=false;}
-            if(released){Json loss=archivedLoss;for(const auto& gen:generations)for(const auto& p:gen->points){ReportLoss(*gen,*p,Clock());loss.push_back(PointSnapshot(*gen,*p));
+            if(released){Json loss=archivedLoss;for(const auto& gen:generations)for(const auto& p:gen->points){ReportLoss(*gen,*p,Clock());ReportRetention(*gen,*p,Clock());loss.push_back(PointSnapshot(*gen,*p));
                     store->Meta({{"kind","coverage"},{"point",p->id},{"generation",gen->generation},{"begin_qpc",p->coverageBegin},
                         {"end_qpc",p->coverageEnd?p->coverageEnd:stopQpc},{"complete",true}});}
                 ReportAdmissionWindow();
@@ -591,14 +623,15 @@ void Runtime::Tick(){
             {"buffered_events_lost",bufferedLost}};
             store->Meta(std::move(note));store->FlushMeta();}catch(...){}}
 }
-void Runtime::Archive(const Generation& gen){for(auto& p:gen.points){ReportLoss(gen,*p,Clock());auto loss=PointSnapshot(gen,*p);archivedLoss.push_back(loss);
-    store->Meta({{"kind","generation_point_retired"},{"generation",gen.generation},{"point",p->id},{"loss",loss},{"qpc",Clock()}});
+void Runtime::Archive(const Generation& gen){for(auto& p:gen.points){ReportLoss(gen,*p,Clock());ReportRetention(gen,*p,Clock());auto loss=PointSnapshot(gen,*p);archivedLoss.push_back(loss);
+    auto retention=RetentionSnapshot(gen,*p);if(p->retention!=RetentionMode::Full)archivedRetention.push_back(retention);
+    store->Meta({{"kind","generation_point_retired"},{"generation",gen.generation},{"point",p->id},{"loss",loss},{"retention",retention},{"qpc",Clock()}});
     store->Meta({{"kind","coverage"},{"point",p->id},{"generation",gen.generation},{"begin_qpc",p->coverageBegin},
         {"end_qpc",p->coverageEnd},{"complete",true}});}}
 void Runtime::NewSession(){
     // Called under stateMutex, and only after the previous session's clean seal.
     Require(clean,"previous session not clean");auto replacement=std::make_unique<Store>(outputRoot);
-    active.store(nullptr);generations.clear();archivedLoss=Json::array();store=std::move(replacement);
+    active.store(nullptr);generations.clear();archivedLoss=Json::array();archivedRetention=Json::array();store=std::move(replacement);
     clean=false;forcedTerminal=false;closeInitiated=false;closeForced=false;stopRequested.store(false);forceRelease.store(false);terminalCallbacks.store(false);admitting.store(false);stopQpc=0;flushQpc=Clock();
     moduleInvalid=false;lastAdmissionNote=Json(nullptr);
     admission.drops.store(0);admission.first.store(0);admission.last.store(0);
@@ -620,9 +653,10 @@ void Runtime::Start(){std::lock_guard lock(stateMutex);Require(!stopRequested.lo
 void Runtime::Mark(const std::string& label){std::lock_guard lock(stateMutex);Require(!clean&&!stopRequested.load()&&!closeInitiated,"session is draining/stopped");
     {std::lock_guard errorLock(errorMutex);Require(storageError.empty(),"storage failed");}Require(!store->SealFailed(),"storage failed");
     Meta({{"kind","user_mark"},{"label",label},{"qpc",Clock()},{"native_semantics",false}});FlushMetaDurable();}
-Json Runtime::Status()const{std::lock_guard lock(stateMutex);Json loss=archivedLoss,ownership=Json::array(),timing=Json::array();uint64_t calls=0,queued=0,memory=0;
+Json Runtime::Status()const{std::lock_guard lock(stateMutex);Json loss=archivedLoss,retention=archivedRetention,ownership=Json::array(),timing=Json::array();uint64_t calls=0,queued=0,memory=0;
     for(const auto& gen:generations){calls+=gen->inFlight.load();for(const auto& p:gen->points){loss.push_back(PointSnapshot(*gen,*p));
-        memory+=p->poolSize*(sizeof(Cell)+2*(p->blobCapacity+p->ops.size()*sizeof(ReadResult)));
+        memory+=p->poolSize*(sizeof(Cell)+2*(p->blobCapacity+p->ops.size()*sizeof(ReadResult)))+p->aggregateCapacity*sizeof(AggregateSlot);
+        if(p->retention!=RetentionMode::Full)retention.push_back(RetentionSnapshot(*gen,*p));
         timing.push_back({{"point",p->id},{"generation",gen->generation},{"samples",p->readSamples.load()},
             {"read_program_ticks",p->readTicks.load()},{"read_program_max_ticks",p->readMax.load()},
             {"filtered_by_plan",p->filtered.load()}});
@@ -634,7 +668,7 @@ Json Runtime::Status()const{std::lock_guard lock(stateMutex);Json loss=archivedL
     std::lock_guard errorLock(errorMutex);auto persistedError=storageError.empty()?store->SealErrorText():storageError;
     return {{"ok",true},{"state",forcedTerminal?"STOPPED_FORCED":clean?"STOPPED_CLEAN":stopRequested.load()?"DRAIN_PENDING":
             !persistedError.empty()?"STORAGE_FAILED":moduleInvalid?"MODULE_REBIND_PENDING":active.load()?"RUNNING":"IDLE"},
-        {"generation",generationCounter},{"in_flight",calls},{"queued_cells",queued},{"loss",loss},{"hooks",ownership},
+        {"generation",generationCounter},{"in_flight",calls},{"queued_cells",queued},{"loss",loss},{"retention",retention},{"hooks",ownership},
         {"resident_generations",generations.size()},{"preallocated_record_bytes",memory},
         {"read_timing",timing},{"qpc_frequency",Frequency()},
         {"admission_window_drops",admission.drops.load()},

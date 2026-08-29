@@ -4,6 +4,7 @@
 namespace uc {
 enum class Backend { Slot, GumProbe };
 enum class PointMode { Single, ProbePair };
+enum class RetentionMode { Full, FirstPerEntryReturnAddress };
 enum class Base { Register, EntryRegister, Argument, Previous, Module };
 enum class Op { Scalar, Relative, Block, Array, CString };
 // Hard ceiling on combined per-point pool preallocation. A bad plan must fail
@@ -36,8 +37,15 @@ struct Record {
     bool parentKnown=false,exceptional=false;
     Abi abi;std::vector<ReadResult> reads;Bytes bytes;size_t used=0;
     uint32_t legacyOffset=0,legacySize=0,legacyFailures=0;bool legacyTruncated=false;
-    uint32_t exitHookId=UINT32_MAX;
+    uint32_t exitHookId=UINT32_MAX;uint64_t retentionKey=0;
 };
+struct AggregateSlot {
+    // key==0 is the empty marker. Entry return addresses are required to be
+    // non-zero before they may enter this table.
+    std::atomic<uint64_t> key{0},count{0},first{UINT64_MAX},last{0},fullRecords{0};
+    std::atomic<uint32_t> sampleState{0}; // 0=missing, 1=callback owns attempt, 2=queued
+};
+struct RetentionResult {bool retain=true;AggregateSlot* slot=nullptr;uint64_t key=0;};
 struct ExitSite {
     std::string id;uint64_t address=0;Bytes prefix;Json contract;uint32_t hookId=UINT32_MAX,requiredRedirectSpan=0;void* runtimeHook=nullptr;
 };
@@ -45,7 +53,8 @@ struct Cell {
     std::atomic<unsigned> state{0},flags{0}; // 0=free,1=initializing,2=active
     Record enter,leave;
 };
-enum class LossReason { QueueOverflow, ReadFailure, Truncation, StorageFailure, FrameTerminationUnknown, Count };
+enum class LossReason { QueueOverflow, ReadFailure, Truncation, StorageFailure, FrameTerminationUnknown,
+    RetentionKeyUnavailable, RetentionCapacity, Count };
 struct ReasonLoss {
     std::atomic<uint64_t> occurrences{0},events{0},bytes{0},unknownBytes{0},first{UINT64_MAX},last{0};
 };
@@ -71,15 +80,20 @@ struct Point {
     std::atomic<uint32_t> freeSlots{0};
     // Deliberate predicate filtering is accounted independently from loss.
     std::atomic<uint64_t> filtered{0};
-    // Per-plan evidence retention. The raw backend context is copied before a
-    // logical point is selected; false suppresses XMM from the stored record.
+    // Per-plan evidence retention. GPRs are copied at callback entry; XMM is
+    // copied only when this logical point retains a full record.
     bool captureXmm=true;
+    RetentionMode retention=RetentionMode::Full;uint32_t aggregateCapacity=0;
+    std::unique_ptr<AggregateSlot[]> aggregates;
+    std::atomic<uint64_t> aggregateCallbacks{0},aggregateDuplicates{0},aggregateSuppressed{0};
+    Json lastReportedRetention; // Writer thread only.
     Json lastReportedLoss; // Writer thread only, never inspected in a callback.
     uint64_t coverageBegin=0,coverageEnd=0;
     // Legacy extensions are data readers, never gameplay interpreters.
     std::string legacyReader;unsigned readerKind=0,legacyKind=0;uint64_t legacyUnity=0,legacyVtable=0;size_t legacyBytes=0;
     std::atomic<uint64_t> readSamples{0},readTicks{0},readMax{0};
     Cell* Acquire();
+    RetentionResult Retain(const Abi&,uint64_t) noexcept;
 };
 struct Generation {
     std::string planId,planHash;uint64_t revision=0,generation=0;

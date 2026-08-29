@@ -65,10 +65,13 @@ def main():
             "resources": {"slots_per_point": 256, "max_record_bytes": 4096}, "points": []}
         for fid, target in (("pair", targets["pair_entry"]), ("recursive", targets["pair_recursive_entry"]),
                             ("block", targets["pair_block_entry"])):
-            source_plan["points"].append({"id": fid, "backend": "gum_probe", "module": "fixture",
+            point = {"id": fid, "backend": "gum_probe", "module": "fixture",
                 "rva": target["rva"], "expected_prefix": target["expected_prefix"], "evidence": ["fixture"],
                 "reads": [{"id": "raw-entry-stack-window", "base": "rsp", "op": "block", "size": 128,
-                           "phase": "enter", "evidence": ["fixture"]}]})
+                           "phase": "enter", "evidence": ["fixture"]}]}
+            if fid == "pair":
+                point["retention"] = {"mode": "first_per_entry_return_address", "max_keys": 16}
+            source_plan["points"].append(point)
         source_plan_path = root / "source-plan.json";source_plan_path.write_bytes(canonical(source_plan))
         prepared = root / "prepared";make_entries(manifest_path, source_plan_path, prepared)
         qualification = json.loads((prepared / "qualification.json").read_text(encoding="utf-8"))
@@ -95,6 +98,10 @@ def main():
             raise AssertionError(acceptance_points)
         if acceptance_points["pair"]["resolved_runtime_callsite_count"] != 1:
             raise AssertionError(acceptance_points["pair"])
+        if acceptance_points["pair"]["status"] != "OBSERVED_AGGREGATED_CALLERS" or \
+                acceptance_points["pair"]["retention_generation"]["scope"] != "activation_generation" or \
+                acceptance_points["pair"]["evidence_scope"] != "activation_generation":
+            raise AssertionError(acceptance_points["pair"])
         if acceptance_points["recursive"]["resolved_runtime_callsite_count"] != 3:
             raise AssertionError(acceptance_points["recursive"])
         result = {"ok": True, "qualified_sites": orchestration["qualification_sites"],
@@ -102,6 +109,7 @@ def main():
             "generation": orchestration["generation"], "events": sum(map(len, by_point.values())),
             "stopped_clean": stopped["state"] == "STOPPED_CLEAN",
             "entry_evidence_accepted": acceptance["accepted"],
+            "aggregated_caller_analysis_accepted": True,
             "runtime_return_address_callsites_resolved": 4,
             "unobserved_point_not_misclassified": True, "game_runtime_verified": False}
     finally:

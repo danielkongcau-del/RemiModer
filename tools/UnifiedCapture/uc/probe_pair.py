@@ -257,12 +257,24 @@ def compile_probe_pair(plan: dict, *, verify_sources: bool = True) -> CompiledPr
         if requirement not in REQUIREMENTS:
             raise ValueError(f"{oid}: exit_capture_requirement")
 
+        retention = observation.get("retention")
+        if retention is not None:
+            if not isinstance(retention, dict) or retention.get("mode") != "first_per_entry_return_address":
+                raise ValueError(f"{oid}: unsupported retention mode")
+            capacity = uint(retention.get("max_keys"), f"{oid}.retention.max_keys", 65536)
+            if not capacity or capacity & (capacity - 1):
+                raise ValueError(f"{oid}: retention max_keys must be a nonzero power of two")
+            if requirement != "none":
+                raise ValueError(f"{oid}: return-address retention is entry-only")
+
         entry = observation.get("entry", {})
         entry_rva = uint(entry.get("rva"), f"{oid}.entry.rva")
         entry_expected = _verified_source_prefix(entry.get("expected_prefix"), f"{oid}.entry.expected_prefix")
         build_hash, entry_span, entry_patch_hash = _patch_contract(
             entry.get("backend_patch_contract"), entry_expected, f"{oid}.entry")
         read_phases = _validate_reads(entry.get("reads", []), sources, modules, max_bytes, f"{oid}.entry")
+        if retention is not None and any("when" in read for read in entry.get("reads", [])):
+            raise ValueError(f"{oid}: return-address retention cannot be combined with read predicates")
         if requirement == "none" and "leave" in read_phases:
             raise ValueError(f"{oid}: leave read requires an exit capture requirement")
         site_rows.append({"module": module, "rva": entry_rva, "span": entry_span,

@@ -38,7 +38,7 @@ class Runtime {
     std::atomic<uint64_t> unattributedStorageLoss{0};
     mutable std::mutex stateMutex,metaMutex,errorMutex;
     std::vector<std::shared_ptr<Generation>> generations;
-    Json archivedLoss=Json::array();
+    Json archivedLoss=Json::array(),archivedRetention=Json::array();
     std::vector<std::unique_ptr<Hook>> hooks;
     std::deque<Json> metadata;
     std::unique_ptr<Store> store;
@@ -54,7 +54,9 @@ class Runtime {
     Bytes ExpectedPrefix(const Hook&)const;
     void WriteRecord(const Generation&,Point&,const Record&,const char*);
     void ReportLoss(const Generation&,Point&,uint64_t);
+    void ReportRetention(const Generation&,Point&,uint64_t);
     static Json PointSnapshot(const Generation&,const Point&);
+    static Json RetentionSnapshot(const Generation&,const Point&);
     void NoteAdmissionDrop() noexcept;
     void ReportAdmissionWindow();
     void Archive(const Generation&);
@@ -67,7 +69,7 @@ public:
     Json Capabilities()const;
     void Begin(Hook&,const Abi&,Token&) noexcept;
     void End(Hook&,const Abi&,Token&,bool exceptional=false) noexcept;
-    void Probe(Hook&,const Abi&) noexcept;
+    void Probe(Hook&,GumInvocationContext*) noexcept;
     void Tick();
     void Meta(Json);
     // Drain the in-memory metadata queue into the durable manifest; control
@@ -80,6 +82,6 @@ public:
     uint64_t SlotOriginal(uint64_t)const;
     static Runtime* instance;
 };
-Abi GumAbi(GumInvocationContext*);
+Abi GumAbi(GumInvocationContext*,bool captureXmm=true);
 void* LegacyWrapper(Hook&);
 }

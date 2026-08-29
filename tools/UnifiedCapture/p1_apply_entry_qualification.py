@@ -73,10 +73,10 @@ def run(manifest_path: Path, plan_path: Path, evidence_path: Path, output: Path,
         for read in point.get("reads", []):
             if read.get("phase") != "enter":
                 raise ValueError(f"{point['id']}: entry-only plan cannot preserve leave reads")
-            copy = dict(read)
-            copy["evidence"] = [point["module"] + "-module", "target-qualification"]
-            reads.append(copy)
-        observations.append({"id": point["id"] + "/entry", "backend": "gum_function_probe_pair",
+            read_copy = dict(read)
+            read_copy["evidence"] = [point["module"] + "-module", "target-qualification"]
+            reads.append(read_copy)
+        observation={"id": point["id"] + "/entry", "backend": "gum_function_probe_pair",
             "module": point["module"],
             "entry": {"rva": function["entry_rva"], "expected_prefix": function["entry_expected_prefix"],
                       "backend_patch_contract": result["backend_patch_contract"], "reads": reads},
@@ -86,7 +86,10 @@ def run(manifest_path: Path, plan_path: Path, evidence_path: Path, output: Path,
             "exit_capture_requirement": exit_requirement,
             "native_exit_manifest": {"path": str(manifest_path), "sha256": file_hash(manifest_path),
                                      "function_id": point["id"]},
-            "evidence": [point["module"] + "-module", "target-qualification"]})
+            "evidence": [point["module"] + "-module", "target-qualification"]}
+        if "retention" in point:
+            observation["retention"] = dict(point["retention"])
+        observations.append(observation)
     plan = {"schema": "uc.capture-plan.v2", "plan_id": "target-qualified-" + source_plan["plan_id"],
         "plan_revision": source_plan["plan_revision"], "process_binding": process_identities[0],
         "modules": {alias: source_plan["modules"][alias]
