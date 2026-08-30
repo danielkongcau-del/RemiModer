@@ -15,6 +15,7 @@ from d0ctl import finish_capture
 from entry_analyze import analyze_run
 from entryctl import prepare_apply
 from p1_make_entry_qualification import run as make_entries
+from retained_caller_inventory import run as inventory_callers
 from uc.model import canonical
 from uc.probe_pair import compile_probe_pair
 
@@ -71,6 +72,8 @@ def main():
                 "reads": [{"id": "raw-entry-stack-window", "base": "rsp", "op": "block", "size": 128,
                            "phase": "enter", "evidence": ["fixture"]}]}
             if fid == "pair":
+                point["reads"] = [{"id": "raw-rcx", "base": "rcx", "op": "register", "width": 8,
+                                   "phase": "enter", "evidence": ["fixture"]}]
                 point["retention"] = {"mode": "first_per_entry_return_address", "max_keys": 16}
             source_plan["points"].append(point)
         source_plan_path = root / "source-plan.json";source_plan_path.write_bytes(canonical(source_plan))
@@ -85,8 +88,12 @@ def main():
         if host.invoke("pair", add=2)["value"] != 12:
             raise AssertionError("pair behavior changed")
         host.invoke("pair_recursive", depth=2)
+        for _ in range(70):
+            host.invoke("pair_recursive", depth=0)
         stopped = finish_capture(host.info["pid"], run, wait_seconds=5)
         acceptance = analyze_run(run, root / "acceptance")
+        inventory = inventory_callers(root / "acceptance" / "entry-acceptance.json",
+                                      root / "caller-inventory")
         campaign_run = root / "campaign-run"
         campaign_unit = campaign_run / "units" / "fixture-multi-entry"
         campaign_unit.mkdir(parents=True)
@@ -103,7 +110,7 @@ def main():
         rows = [event for event, _ in records(stopped["directory"])]
         by_point = {point: [row for row in rows if row["point"] == point]
                     for point in ("pair/entry", "recursive/entry")}
-        if len(by_point["pair/entry"]) != 1 or len(by_point["recursive/entry"]) != 3:
+        if len(by_point["pair/entry"]) != 1 or len(by_point["recursive/entry"]) != 73:
             raise AssertionError(by_point)
         if any(row["kind"] != "probe" for values in by_point.values() for row in values):
             raise AssertionError(by_point)
@@ -116,7 +123,13 @@ def main():
                 acceptance_points["pair"]["retention_generation"]["scope"] != "activation_generation" or \
                 acceptance_points["pair"]["evidence_scope"] != "activation_generation":
             raise AssertionError(acceptance_points["pair"])
-        if acceptance_points["recursive"]["resolved_runtime_callsite_count"] != 3:
+        if not inventory["all_retained_points_complete"] or \
+                inventory["totals"]["exact_promotion_eligible"] != 1:
+            raise AssertionError(inventory)
+        if acceptance_points["recursive"]["resolved_runtime_callsite_count"] != 73 or \
+                acceptance_points["recursive"]["event_count"] != 73 or \
+                acceptance_points["recursive"]["event_ids_complete"] is not False or \
+                len(acceptance_points["recursive"]["event_ids"]) != 64:
             raise AssertionError(acceptance_points["recursive"])
         if not campaign_acceptance["accepted"] or \
                 campaign_acceptance["run"]["unit_path"] != str(campaign_unit.resolve()):
@@ -128,7 +141,7 @@ def main():
             "entry_evidence_accepted": acceptance["accepted"],
             "aggregated_caller_analysis_accepted": True,
             "campaign_layout_analysis_accepted": True,
-            "runtime_return_address_callsites_resolved": 4,
+            "runtime_return_address_callsites_resolved": 74,
             "unobserved_point_not_misclassified": True, "game_runtime_verified": False}
     finally:
         host.close()

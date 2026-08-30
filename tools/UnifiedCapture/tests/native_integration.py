@@ -14,7 +14,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from capturectl import request
 from uc.model import canonical, digest, validate
-from uc.store import decode_chunk, inspect_session
+from uc.store import decode_chunk_file, inspect_session
 
 class Host:
     def __init__(self, root, bootstrap_text=None):
@@ -189,7 +189,7 @@ class Host:
 def records(directory):
     result = []
     for path in sorted(Path(directory).glob("*.ucb")):
-        _, rows = decode_chunk(path.read_bytes())
+        _, rows = decode_chunk_file(path)
         result.extend((event, blob) for _, _, event, blob in rows)
     return sorted(result, key=lambda row: row[0]["event_id"])
 
@@ -223,6 +223,8 @@ def main():
         checks.append("17->18->17 activation generations remain distinct")
         inspection = inspect_session(Path(stopped["directory"]))
         assert inspection["storage_complete"], inspection
+        assert inspection["chunks"] and all(chunk["record_encoding"] == "uc.record.v2"
+                                            for chunk in inspection["chunks"]), inspection
         rows = records(stopped["directory"])
         float_events = [e for e, _ in rows if e["point"] == "float"]
         assert float_events[0]["semantic_interpretation"]["validated_argument_bits"][2]["bits"] == 0x7fc01234
@@ -234,6 +236,7 @@ def main():
         assert all(e["raw_abi"]["xmm_mask"] == 65535 for e in gum_events)
         assert all(not item["events"] for item in stopped["loss"])
         checks.append("native compressed chunks independently verified; raw ABI/semantic values separated")
+        checks.append("runtime evidence original uses compact binary v3; JSON is a dictionary-backed offline projection")
         result = {"ok": True, "checks": checks, "status": stopped, "inspection": inspection,
                   "events": len(rows), "game_runtime_verified": False}
     except Exception as error:

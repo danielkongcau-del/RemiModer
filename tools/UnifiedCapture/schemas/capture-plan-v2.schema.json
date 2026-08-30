@@ -35,10 +35,119 @@
             "type": "object",
             "required": ["mode", "max_keys"],
             "properties": {
-              "mode": {"const": "first_per_entry_return_address"},
-              "max_keys": {"enum": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]}
+              "mode": {"enum": ["first_per_entry_return_address", "first_per_composite_key"]},
+              "max_keys": {"enum": [1, 2, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536]},
+              "key": {
+                "type": "array", "minItems": 2, "maxItems": 4,
+                "prefixItems": [{
+                  "type": "object", "required": ["kind", "evidence"],
+                  "properties": {
+                    "kind": {"const": "entry_return_address"},
+                    "mask": {"type": "integer", "minimum": 0},
+                    "evidence": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+                  }, "additionalProperties": false
+                }],
+                "items": {
+                  "oneOf": [{
+                    "type": "object", "required": ["kind", "evidence"],
+                    "properties": {
+                      "kind": {"const": "entry_return_address"},
+                      "mask": {"type": "integer", "minimum": 0},
+                      "evidence": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+                    }, "additionalProperties": false
+                  }, {
+                    "type": "object", "required": ["kind", "register", "evidence"],
+                    "properties": {
+                      "kind": {"const": "register"},
+                      "register": {"enum": ["rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13", "r14", "r15", "rip"]},
+                      "mask": {"type": "integer", "minimum": 0},
+                      "evidence": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+                    }, "additionalProperties": false
+                  }]
+                }
+              },
+              "exact_callers": {
+                "type": "array",
+                "maxItems": 256,
+                "items": {
+                  "type": "object",
+                  "required": ["module", "return_rva", "evidence"],
+                  "properties": {
+                    "module": {"type": "string", "minLength": 1},
+                    "return_rva": {"type": "integer", "minimum": 0},
+                    "evidence": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+                  },
+                  "additionalProperties": false
+                }
+              }
             },
-            "description": "Entry-only evidence policy: retain one full event per observed caller return address and independently count all duplicates."
+            "allOf": [{
+              "if": {"properties": {"mode": {"const": "first_per_composite_key"}}},
+              "then": {"required": ["key"]},
+              "else": {"not": {"required": ["key"]}}
+            }],
+            "additionalProperties": false,
+            "description": "Entry-only evidence policy: count every raw key, retain one full sample per key, and retain every callback for explicitly evidence-backed exact callers. Composite keys must begin with the architectural entry return address and add only raw register bits."
+          },
+          "completion": {
+            "type": "object",
+            "required": ["mode", "sites"],
+            "properties": {
+              "mode": {"const": "caller_continuation"},
+              "sites": {
+                "type": "array", "minItems": 1, "maxItems": 256,
+                "items": {
+                  "type": "object",
+                  "required": ["id", "module", "return_rva", "expected_prefix", "backend_patch_contract",
+                               "predecessor_call", "source_contract", "capture_contract", "evidence"],
+                  "properties": {
+                    "id": {"type": "string", "minLength": 1},
+                    "module": {"type": "string", "minLength": 1},
+                    "return_rva": {"type": "integer", "minimum": 0},
+                    "expected_prefix": {"type": "string", "pattern": "^[0-9a-f]+$", "minLength": 32},
+                    "backend_patch_contract": {"type": "object"},
+                    "predecessor_call": {
+                      "type": "object",
+                      "required": ["callsite_rva", "instruction_size", "instruction_bytes", "call_kind"],
+                      "properties": {
+                        "callsite_rva": {"type": "integer", "minimum": 0},
+                        "instruction_size": {"type": "integer", "minimum": 1, "maximum": 15},
+                        "instruction_bytes": {"type": "string", "pattern": "^[0-9a-f]+$"},
+                        "call_kind": {"enum": ["direct", "indirect"]}
+                      }, "additionalProperties": false
+                    },
+                    "source_contract": {
+                      "type": "object",
+                      "required": ["instruction_boundary_verified_by", "predecessor_call_ends_at_return_rva",
+                                   "relocation_window_instruction_complete", "direct_interior_edge_free",
+                                   "semantic_safe_span"],
+                      "properties": {
+                        "instruction_boundary_verified_by": {"const": "capstone"},
+                        "predecessor_call_ends_at_return_rva": {"const": true},
+                        "relocation_window_instruction_complete": {"const": true},
+                        "direct_interior_edge_free": {"const": true},
+                        "semantic_safe_span": {"type": "integer", "minimum": 16}
+                      }, "additionalProperties": false
+                    },
+                    "capture_contract": {
+                      "type": "object",
+                      "required": ["probe_semantics", "completion_semantics", "same_thread_pairing",
+                                   "exceptional_exit_observed", "return_value_stable", "xmm_return_stable"],
+                      "properties": {
+                        "probe_semantics": {"const": "pre_instruction"},
+                        "completion_semantics": {"const": "normal_return_to_observed_callsite_continuation"},
+                        "same_thread_pairing": {"const": true},
+                        "exceptional_exit_observed": {"const": false},
+                        "return_value_stable": {"const": true},
+                        "xmm_return_stable": {"const": true}
+                      }, "additionalProperties": false
+                    },
+                    "evidence": {"type": "array", "minItems": 1, "items": {"type": "string", "minLength": 1}}
+                  }, "additionalProperties": false
+                }
+              }
+            }, "additionalProperties": false,
+            "description": "Normal-return evidence at the exact observed caller continuation. This is not a complete callee exit-set claim."
           },
           "entry": {
             "type": "object",
@@ -78,8 +187,8 @@
                                        {"type": "string", "minLength": 1}]},
                     "offset": {"type": "integer", "minimum": 0},
                     "phase": {"enum": ["enter", "leave"], "default": "enter"},
-                    "op": {"enum": ["scalar", "relative", "block", "string", "array"], "default": "scalar"},
-                    "width": {"enum": [1, 2, 4, 8], "description": "scalar/relative byte width."},
+                    "op": {"enum": ["scalar", "relative", "register", "block", "string", "array"], "default": "scalar"},
+                    "width": {"enum": [1, 2, 4, 8], "description": "scalar/relative/register byte width."},
                     "size": {"type": "integer", "minimum": 1, "description": "block byte size."},
                     "max_bytes": {"type": "integer", "minimum": 1, "maximum": 4096,
                                   "description": "string capacity; NUL must appear within it for status ok."},
@@ -88,20 +197,26 @@
                     "max_count": {"type": "integer", "minimum": 1},
                     "when": {
                       "type": "object",
-                      "required": ["op", "value"],
+                      "required": ["op"],
                       "properties": {
-                        "op": {"enum": ["eq", "neq"]},
+                        "op": {"enum": ["eq", "neq", "in"]},
                         "value": {"type": "integer", "minimum": 0},
+                        "values": {"type": "array", "minItems": 1, "maxItems": 16,
+                                   "items": {"type": "integer", "minimum": 0}, "uniqueItems": true},
                         "mask": {"type": "integer", "minimum": 0,
                                  "description": "raw loaded bits are masked before the comparison."}
                       },
-                      "description": "Entry-phase predicate on the loaded scalar; non-matching events are filtered and counted (filtered_by_plan), not recorded."
+                      "oneOf": [
+                        {"properties": {"op": {"enum": ["eq", "neq"]}}, "required": ["value"]},
+                        {"properties": {"op": {"const": "in"}}, "required": ["values"]}
+                      ],
+                    "description": "Entry-phase predicate on loaded scalar or copied register bits; non-matching events are filtered and counted (filtered_by_plan), not recorded."
                     },
                     "evidence": {"type": "array", "minItems": 1}
                   },
                   "allOf": [{
                     "if": {"required": ["when"]},
-                    "then": {"properties": {"phase": {"const": "enter"}, "op": {"enum": ["scalar", "relative"]}}}
+                    "then": {"properties": {"phase": {"const": "enter"}, "op": {"enum": ["scalar", "relative", "register"]}}}
                   }, {
                     "if": {"required": ["base"], "properties": {"base": {"pattern": "^entry:"}}},
                     "then": {"required": ["phase"], "properties": {"phase": {"const": "leave"}}}
@@ -124,7 +239,20 @@
         },
         "allOf": [{
           "if": {"required": ["retention"]},
-          "then": {"properties": {"exit_capture_requirement": {"const": "none"}}}
+          "then": {"anyOf": [
+            {"properties": {"exit_capture_requirement": {"const": "none"}}},
+            {"properties": {"retention": {"required": ["exact_callers"],
+              "properties": {"exact_callers": {"minItems": 1}}}}}
+          ]}
+        }, {
+          "if": {"required": ["completion"]},
+          "then": {
+            "required": ["retention"],
+            "properties": {
+              "exit_capture_requirement": {"enum": ["completion", "return_value", "path_identity"]},
+              "retention": {"required": ["exact_callers"], "properties": {"exact_callers": {"minItems": 1}}}
+            }
+          }
         }]
       }
     },

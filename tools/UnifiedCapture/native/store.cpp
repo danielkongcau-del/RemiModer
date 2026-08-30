@@ -1,7 +1,14 @@
 #include "store.h"
 namespace uc {
 static void Put(Bytes& into,const void* raw,size_t size){auto p=(const unsigned char*)raw;into.insert(into.end(),p,p+size);}
-Store::Store(const fs::path& root){session=UniqueId();directory=root/fs::path(session);
+namespace {
+void High(std::atomic<uint64_t>& target,uint64_t value)noexcept{auto prior=target.load(std::memory_order_relaxed);
+    while(value>prior&&!target.compare_exchange_weak(prior,value,std::memory_order_relaxed)){} }
+uint64_t PerSecond(uint64_t value,uint64_t ticks)noexcept {if(!ticks)return 0;
+    const long double rate=(long double)value*(long double)Frequency()/(long double)ticks;
+    return rate>UINT64_MAX?UINT64_MAX:(uint64_t)rate;}
+}
+Store::Store(const fs::path& root){startQpc=Clock();session=UniqueId();directory=root/fs::path(session);
     Require(fs::create_directories(directory),"session directory already exists");manifest=directory/L"session.manifest";
     FILETIME now{};GetSystemTimeAsFileTime(&now);ULARGE_INTEGER ticks{};ticks.LowPart=now.dwLowDateTime;ticks.HighPart=now.dwHighDateTime;
     Meta(Json{{"kind","session"},{"schema","uc.session.v1"},{"session_id",session},{"pid",GetCurrentProcessId()},
@@ -38,7 +45,9 @@ void Store::FlushMeta(){
     // One open/fsync/close for the whole batch; a physical append failure may
     // have written a prefix, so retrying the same bytes would be dishonest.
     // Poison the store and preserve that detectable tail instead.
-    try{AppendMetaLine(std::move(all));}
+    try{const auto began=Clock();const auto bytes=all.size();AppendMetaLine(std::move(all));
+        manifestFlushes.fetch_add(1,std::memory_order_relaxed);manifestBytes.fetch_add(bytes,std::memory_order_relaxed);
+        manifestFlushTicks.fetch_add(Clock()-began,std::memory_order_relaxed);}
     catch(const std::exception& e){std::lock_guard lock(sealMutex);if(sealError.empty())sealError=std::string("manifest: ")+e.what();
         failed.store(true,std::memory_order_release);throw;}}
 void Store::AppendMetaLine(std::string line){
@@ -52,21 +61,32 @@ void Store::AppendMetaLine(std::string line){
     catch(...){CloseHandle(f);throw;}
     CloseHandle(f);}
 void Store::Event(const Json& event,const void* blob,size_t size){
+    auto meta=event.dump();AppendEvent("uc.record.v1",event.at("event_id").get<uint64_t>(),event.at("qpc").get<uint64_t>(),
+        meta.data(),meta.size(),blob,size);}
+void Store::RawEvent(uint64_t id,uint64_t qpc,const void* metadata,size_t metadataSize,const void* blob,size_t blobSize){
+    AppendEvent("uc.record.v2",id,qpc,metadata,metadataSize,blob,blobSize);}
+void Store::AppendEvent(const char* encoding,uint64_t id,uint64_t qpc,const void* metadata,size_t metadataSize,
+                        const void* blob,size_t blobSize){
+    const auto began=Clock();eventAttempts.fetch_add(1,std::memory_order_relaxed);
     if(Sealed()||closeRequested)throw std::runtime_error("sealed evidence session");
     if(auto error=SealErrorText();!error.empty())throw std::runtime_error("sealing failed earlier: "+error);
+    if(count&&payloadEncoding!=encoding&&!EnqueueSeal()){
+        storeBackpressure.fetch_add(1,std::memory_order_relaxed);throw StoreBackpressure();}
+    if(!count)payloadEncoding=encoding;
     // Do not grow the worker buffer while a full chunk is waiting for bounded
     // background capacity. The caller accounts this event independently.
-    if(payload.size()>=4*1024*1024&&!EnqueueSeal())throw StoreBackpressure();
-    auto meta=event.dump();
-    Require(meta.size()<=UINT32_MAX&&size<=UINT32_MAX,"event format size overflow");uint32_t m=(uint32_t)meta.size(),b=(uint32_t)size;
-    auto id=event.at("event_id").get<uint64_t>(),qpc=event.at("qpc").get<uint64_t>();
+    if(payload.size()>=TargetSegmentBytes&&!EnqueueSeal()){
+        storeBackpressure.fetch_add(1,std::memory_order_relaxed);throw StoreBackpressure();}
+    Require(metadataSize<=UINT32_MAX&&blobSize<=UINT32_MAX,"event format size overflow");uint32_t m=(uint32_t)metadataSize,b=(uint32_t)blobSize;
     const uint64_t required=8ull+m+b;Require(required<=SIZE_MAX-payload.size(),"event buffer size overflow");
     // Reserve before the first mutation. A failed allocation cannot leave a
     // partial record that would corrupt every later record in this chunk.
     payload.reserve(payload.size()+(size_t)required);
-    Put(payload,&m,4);Put(payload,&b,4);Put(payload,meta.data(),m);if(b)Put(payload,blob,b);
+    Put(payload,&m,4);Put(payload,&b,4);Put(payload,metadata,m);if(b)Put(payload,blob,b);
     minId=std::min(minId,id);maxId=std::max(maxId,id);minQpc=std::min(minQpc,qpc);maxQpc=std::max(maxQpc,qpc);++count;++eventTotal;
-    if(payload.size()>=4*1024*1024)EnqueueSeal();}
+    encodedBytes.fetch_add(required,std::memory_order_relaxed);High(payloadHighWater,payload.size());
+    const auto ticks=Clock()-began;eventEncodeTicks.fetch_add(ticks,std::memory_order_relaxed);High(eventEncodeMax,ticks);
+    if(payload.size()>=TargetSegmentBytes)EnqueueSeal();}
 bool Store::EnqueueSeal(bool closing) {
     if(!count)return true;
     // Reserve the immutable chunk id at enqueue time. The sealer may lag by
@@ -77,7 +97,7 @@ bool Store::EnqueueSeal(bool closing) {
         if(!sealError.empty())throw std::runtime_error("sealing failed earlier: "+sealError);
         Require(!shutdown,"sealer already stopped");
         // Capture-time enqueue never waits. The worker retains its current
-        // chunk and later events are loss-accounted as queue overflow. Closing
+        // chunk and later events are loss-accounted as store_backpressure. Closing
         // may add one final bounded chunk beyond the steady-state ceiling.
         if(!closing&&(bytes>MaxOutstandingSealBytes||
             outstandingSealBytes>MaxOutstandingSealBytes-bytes))return false;
@@ -85,23 +105,27 @@ bool Store::EnqueueSeal(bool closing) {
         // If allocation throws, every event and counter remains on the worker
         // side and a later stop can still report the failure honestly.
         pending.emplace_back();auto& job=pending.back();
-        job.chunk=nextChunk++;job.minId=minId;job.maxId=maxId;job.minQpc=minQpc;job.maxQpc=maxQpc;job.count=count;
-        job.payload.swap(payload);outstandingSealBytes+=bytes;
+        job.chunk=nextChunk++;job.minId=minId;job.maxId=maxId;job.minQpc=minQpc;job.maxQpc=maxQpc;job.count=count;job.encoding=payloadEncoding;
+        job.payload.swap(payload);outstandingSealBytes+=bytes;High(outstandingHighWater,outstandingSealBytes);High(pendingJobsHighWater,pending.size());
     }
-    count=0;minId=minQpc=UINT64_MAX;maxId=maxQpc=0;sealCv.notify_one();return true;}
+    count=0;minId=minQpc=UINT64_MAX;maxId=maxQpc=0;payloadEncoding.clear();sealCv.notify_one();return true;}
 void Store::Flush(){if(!Sealed()&&!closeRequested){if(auto error=SealErrorText();!error.empty())throw std::runtime_error("sealing failed earlier: "+error);EnqueueSeal();}}
 void Store::SealOne(const SealJob& job){
     const auto began=Clock();
+    uint64_t backlog=0;{std::lock_guard lock(sealMutex);backlog=outstandingSealBytes;}
+    const bool attemptCompression=backlog<=CompressionDisableBacklogBytes;
+    if(attemptCompression)compressionAttempts.fetch_add(1);else compressionBypasses.fetch_add(1);
     Bytes stored;std::string codec="none";COMPRESSOR_HANDLE compressor=nullptr;
-    if(CreateCompressor(COMPRESS_ALGORITHM_XPRESS_HUFF,nullptr,&compressor)){
+    if(attemptCompression&&CreateCompressor(COMPRESS_ALGORITHM_XPRESS_HUFF,nullptr,&compressor)){
         SIZE_T needed=0;Compress(compressor,job.payload.data(),job.payload.size(),nullptr,0,&needed);
         if(needed){stored.resize(needed);if(Compress(compressor,job.payload.data(),job.payload.size(),stored.data(),stored.size(),&needed)){
             stored.resize(needed);if(stored.size()<job.payload.size())codec="xpress_huff";}}
         CloseCompressor(compressor);}
-    if(codec=="none")stored=job.payload;
-    Json header={{"format_version",1},{"record_encoding","uc.record.v1"},{"session_id",session},{"chunk_id",job.chunk},
+    if(codec=="none"){stored=job.payload;rawChunks.fetch_add(1);}else compressedChunks.fetch_add(1);
+    Json header={{"format_version",1},{"record_encoding",job.encoding},{"session_id",session},{"chunk_id",job.chunk},
         {"min_event_id",job.minId},{"max_event_id",job.maxId},{"min_qpc",job.minQpc},{"max_qpc",job.maxQpc},{"event_count",job.count},
-        {"uncompressed_size",job.payload.size()},{"compressed_size",stored.size()},{"compression_type",codec}};
+        {"uncompressed_size",job.payload.size()},{"compressed_size",stored.size()},{"compression_type",codec},
+        {"compression_policy",attemptCompression?"attempted-xpress-huff":"bypassed-for-backlog"}};
     auto unsignedHeader=header.dump();Bytes hashed(unsignedHeader.begin(),unsignedHeader.end());Put(hashed,stored.data(),stored.size());
     header["sha256"]=Sha(hashed.data(),hashed.size());header["crc32c"]=Crc(stored.data(),stored.size());auto raw=header.dump();
     Bytes file;Put(file,"UCCHNK01",8);uint32_t hs=(uint32_t)raw.size();uint64_t ps=stored.size();Put(file,&hs,4);Put(file,&ps,8);
@@ -136,7 +160,7 @@ void Store::BeginClose(const Json& loss,const std::string& cleanup){
     if(auto error=SealErrorText();!error.empty()){
         // Events accumulated on the worker while the asynchronous failure was
         // still propagating are now known-unsealable too.
-        bufferedEventsLost.fetch_add(count);count=0;payload.clear();minId=minQpc=UINT64_MAX;maxId=maxQpc=0;
+        bufferedEventsLost.fetch_add(count);count=0;payload.clear();payloadEncoding.clear();minId=minQpc=UINT64_MAX;maxId=maxQpc=0;
         throw std::runtime_error("sealing failed earlier: "+error);}
     // Prepare final metadata before publishing any close state. Allocation
     // failure leaves the live session and worker payload unchanged.
@@ -155,12 +179,25 @@ void Store::Close(const Json& loss,const std::string& cleanup){
 bool Store::SealFailed()const{std::lock_guard lock(sealMutex);return !sealError.empty();}
 std::string Store::SealErrorText()const{std::lock_guard lock(sealMutex);return sealError;}
 uint64_t Store::DrainBufferedEventsLost(){uint64_t lost=bufferedEventsLost.exchange(0);
-    if(SealFailed()&&count){lost+=count;count=0;payload.clear();minId=minQpc=UINT64_MAX;maxId=maxQpc=0;}return lost;}
+    if(SealFailed()&&count){lost+=count;count=0;payload.clear();payloadEncoding.clear();minId=minQpc=UINT64_MAX;maxId=maxQpc=0;}return lost;}
 Json Store::Status()const{std::lock_guard lock(sealMutex);uint64_t pendingBytes=0;for(const auto& job:pending)pendingBytes+=job.payload.size();
-    return {{"events_encoded",eventTotal.load()},{"sealed_chunks",sealedChunks.load()},
+    const auto elapsed=Clock()-startQpc;const auto events=eventTotal.load();const auto encoded=encodedBytes.load();
+    const auto raw=rawTotal.load(),stored=storedTotal.load();
+    return {{"events_attempted",eventAttempts.load()},{"events_encoded",events},{"encoded_record_bytes",encoded},
+        {"store_backpressure_events",storeBackpressure.load()},{"event_encode_ticks",eventEncodeTicks.load()},
+        {"event_encode_max_ticks",eventEncodeMax.load()},{"events_encoded_per_second",PerSecond(events,elapsed)},
+        {"encoded_record_bytes_per_second",PerSecond(encoded,elapsed)},{"sealed_chunks",sealedChunks.load()},
         {"buffered_bytes",payload.size()},{"pending_seal_jobs",pending.size()},{"pending_seal_bytes",pendingBytes},
         {"active_seal_bytes",activeSealBytes},{"outstanding_seal_bytes",outstandingSealBytes},
-        {"max_outstanding_seal_bytes",MaxOutstandingSealBytes},
-        {"sealed_raw_payload_bytes",rawTotal.load()},{"sealed_file_bytes",storedTotal.load()},{"flush_ticks",flushTicks.load()},
+        {"buffered_bytes_high_water",payloadHighWater.load()},{"pending_seal_jobs_high_water",pendingJobsHighWater.load()},
+        {"outstanding_seal_bytes_high_water",outstandingHighWater.load()},{"target_segment_bytes",TargetSegmentBytes},
+        {"max_outstanding_seal_bytes",MaxOutstandingSealBytes},{"compression_disable_backlog_bytes",CompressionDisableBacklogBytes},
+        {"compression_attempts",compressionAttempts.load()},{"compression_bypasses",compressionBypasses.load()},
+        {"compressed_chunks",compressedChunks.load()},{"raw_chunks",rawChunks.load()},
+        {"sealed_raw_payload_bytes",raw},{"sealed_file_bytes",stored},{"flush_ticks",flushTicks.load()},
+        {"sealed_raw_payload_bytes_per_second",PerSecond(raw,elapsed)},
+        {"sealed_file_bytes_per_second",PerSecond(stored,elapsed)},
+        {"manifest_flushes",manifestFlushes.load()},{"manifest_bytes",manifestBytes.load()},
+        {"manifest_flush_ticks",manifestFlushTicks.load()},{"elapsed_qpc",elapsed},{"qpc_frequency",Frequency()},
         {"seal_error",sealError}};}
 }

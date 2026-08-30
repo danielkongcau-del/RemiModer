@@ -1,0 +1,44 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "uc.EventDictionary.v3",
+  "type": "object",
+  "required": ["kind", "schema", "generation", "plan_hash", "points"],
+  "properties": {
+    "kind": {"const": "event_dictionary"},
+    "schema": {"const": "uc.EventDictionary.v3"},
+    "generation": {"type": "integer", "minimum": 1},
+    "plan_hash": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "points": {
+      "type": "array", "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["point_numeric_id", "point", "backend", "mode", "abi", "reads", "exits",
+                     "legacy_reader", "retention_mode", "retention_key"],
+        "properties": {
+          "point_numeric_id": {"type": "integer", "minimum": 1},
+          "point": {"type": "string", "minLength": 1},
+          "backend": {"enum": ["slot", "gum_probe"]},
+          "mode": {"enum": ["entry-only", "probe-pair"]},
+          "abi": {"type": "string"},
+          "reads": {"type": "array", "items": {"type": "string"}},
+          "exits": {"type": "array"},
+          "legacy_reader": {"type": "string"},
+          "retention_mode": {"enum": ["full", "first_per_entry_return_address", "first_per_composite_key"]},
+          "retention_key": {
+            "type": "array", "maxItems": 4,
+            "items": {
+              "type": "object", "required": ["kind", "mask"],
+              "properties": {
+                "kind": {"enum": ["entry_return_address", "register"]},
+                "register": {"type": "string"},
+                "mask": {"type": "integer", "minimum": 0}
+              }, "additionalProperties": false
+            }
+          }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}

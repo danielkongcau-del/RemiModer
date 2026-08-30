@@ -83,7 +83,7 @@ uc::Json Handle(const uc::Json& request){
             {{"ok",false},{"request_id",pendingRequestId},{"state","PLAN_CANCELED_BY_STOP"},
              {"error","pending plan canceled by stop"},{"retry_will_not_execute",true}};
         pendingPlan=nullptr;pendingRequestId.clear();result={{"ok",true},{"accepted",true},{"completion","query status"}};}
-    else if(command=="mark"){runtime->Mark(request.at("label"));result={{"ok",true},{"accepted",true}};}
+    else if(command=="mark"){result={{"ok",true},{"accepted",true},{"checkpoint",runtime->Mark(request.at("label"))}};}
     else throw std::runtime_error("unknown command");
     result["request_id"]=id;
     if(command=="start"||command=="stop"||command=="mark")result["generation"]=runtime->Status().at("generation");

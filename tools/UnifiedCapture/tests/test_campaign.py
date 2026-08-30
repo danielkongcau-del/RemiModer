@@ -8,11 +8,36 @@ import hashlib
 import json
 import tempfile
 
-from p1_apply_entry_qualification import validate_qualification_scope
+from p1_apply_entry_qualification import (derive_entry_qualified_manifest,
+                                          qualified_evidence_refs,
+                                          qualified_source_table,
+                                          validate_qualification_scope)
 from p1_merge_entry_plans import run as merge_entry_plans
 
 
 class CampaignQualificationTests(unittest.TestCase):
+    def test_entry_qualification_does_not_promote_exit_claims(self):
+        with tempfile.TemporaryDirectory() as directory:
+            evidence = Path(directory) / "qualification.json"
+            evidence.write_text("{}", encoding="utf-8")
+            manifest = {"schema": "uc.native-exit-manifest.v1",
+                "status": "mechanical-candidate", "functions": [{
+                    "function_id": "F", "module": "m", "entry_rva": 1,
+                    "runtime_functions": [{"runtime_function_role": "primary"}],
+                    "normal_exits": [], "terminal_sites": [],
+                    "completeness": {"normal_exit_set_complete": False,
+                                     "tail_set_complete": False,
+                                     "cold_fragments_complete": False}}]}
+            identity = {"pid": 7, "creation_time_100ns": 11}
+            derived = derive_entry_qualified_manifest(manifest, evidence, identity)
+            self.assertEqual(derived["status"], "partially-verified")
+            self.assertEqual(derived["qualification_scope"], "entry-only")
+            self.assertTrue(derived["entry_activation_ready"])
+            self.assertFalse(derived["exit_activation_ready"])
+            self.assertEqual(derived["functions"][0]["completeness"],
+                             manifest["functions"][0]["completeness"])
+            self.assertEqual(manifest["status"], "mechanical-candidate")
+
     def test_exact_scope_remains_default(self):
         validate_qualification_scope({"a": 1}, {"a": 2}, {"a"}, False)
         with self.assertRaisesRegex(ValueError, "exactly cover source plan"):
@@ -26,6 +51,33 @@ class CampaignQualificationTests(unittest.TestCase):
     def test_response_must_cover_whole_request_even_for_subplan(self):
         with self.assertRaisesRegex(ValueError, "exactly cover its request"):
             validate_qualification_scope({"a": 1, "b": 1}, {"a": 2}, {"a"}, True)
+
+    def test_target_qualification_preserves_field_authority(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            module = root / "game.dll"
+            fields = root / "fields.txt"
+            qualification = root / "qualification.json"
+            module.write_bytes(b"module")
+            fields.write_bytes(b"runtime field harvest")
+            qualification.write_bytes(b"qualification")
+            digest = lambda path: hashlib.sha256(path.read_bytes()).hexdigest()
+            plan = {
+                "sources": {
+                    "game-module": {"path": str(module), "sha256": digest(module)},
+                    "runtime-field-layout": {"path": str(fields), "sha256": digest(fields)},
+                },
+                "points": [{"module": "game"}],
+            }
+            manifest_sources = {"game": {"path": str(module), "sha256": digest(module)}}
+            table = qualified_source_table(plan, manifest_sources, qualification)
+            self.assertEqual(set(table), {
+                "game-module", "runtime-field-layout", "target-qualification"
+            })
+            self.assertEqual(
+                qualified_evidence_refs(["runtime-field-layout"], "game"),
+                ["runtime-field-layout", "game-module", "target-qualification"],
+            )
 
     def test_merge_verifies_used_sources_and_prunes_retired_unused_rows(self):
         with tempfile.TemporaryDirectory() as directory:

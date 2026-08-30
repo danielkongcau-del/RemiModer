@@ -5,6 +5,7 @@
 using uc::Json;
 struct State {uint64_t value=10,count=3;unsigned char data[24]{};};
 static State fixtureState;
+static State fixtureAlternate;
 static HANDLE releaseEvent=nullptr,enteredEvent=nullptr;
 static std::vector<std::thread> blocked;
 static HMODULE dependency=nullptr;
@@ -73,7 +74,8 @@ int wmain(int argc,wchar_t** argv){
     add("pair_block_entry",(void*)PairRuntimeBlock,(void*)PairRuntimeBlock,"");
     add("pair_block_exit",findPairExit((void*)PairRuntimeBlock),findPairExit((void*)PairRuntimeBlock),"");
     Json info={{"pid",GetCurrentProcessId()},{"module",uc::fs::path(path).filename().string()},{"module_path",uc::fs::path(path).string()},
-        {"sha256",uc::FileSha(path)},{"base",base},{"object",(uint64_t)&fixtureState},{"targets",targets}};
+        {"sha256",uc::FileSha(path)},{"base",base},{"object",(uint64_t)&fixtureState},
+        {"alternate_object",(uint64_t)&fixtureAlternate},{"targets",targets}};
     std::cout<<info.dump()<<std::endl;
     releaseEvent=CreateEventW(nullptr,TRUE,FALSE,nullptr);enteredEvent=CreateEventW(nullptr,TRUE,FALSE,nullptr);
     std::string line;while(std::getline(std::cin,line)){try{auto cmd=Json::parse(line);auto op=cmd.at("op").get<std::string>();Json result;
@@ -87,6 +89,9 @@ int wmain(int argc,wchar_t** argv){
         else if(op=="pair"){result={{"value",PairRuntimeTarget(&fixtureState.value,cmd.value("add",1ULL))}};}
         else if(op=="pair_stress"){unsigned count=cmd.value("count",10000U);for(unsigned i=0;i<count;++i)PairRuntimeTarget(&fixtureState.value,1);
             result={{"calls",count},{"value",fixtureState.value}};}
+        else if(op=="pair_composite_stress"){unsigned count=cmd.value("count",10000U);for(unsigned i=0;i<count;++i)
+                PairRuntimeTarget(i&1?&fixtureAlternate.value:&fixtureState.value,1);
+            result={{"calls",count},{"value",fixtureState.value},{"alternate_value",fixtureAlternate.value}};}
         else if(op=="pair_recursive"){result={{"value",PairRuntimeRecursive(&fixtureState.value,cmd.value("depth",3U))}};}
         else if(op=="pair_block"){ResetEvent(releaseEvent);ResetEvent(enteredEvent);blocked.emplace_back([](){PairRuntimeBlock(&fixtureState.value);});
             WaitForSingleObject(enteredEvent,3000);result={{"blocked",true}};}

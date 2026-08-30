@@ -8,8 +8,9 @@ int wmain(int argc,wchar_t** argv){
         std::vector<unsigned char> blob(3*1024*1024);
         uint32_t state=0x9e3779b9U;
         for(auto& byte:blob){state=state*1664525U+1013904223U;byte=(unsigned char)(state>>24);}
-        for(uint64_t i=1;i<=5;++i)store.Event({{"schema","uc.event.v1"},{"event_id",i},{"qpc",i},
+        for(uint64_t i=1;i<=5;++i){store.Event({{"schema","uc.event.v1"},{"event_id",i},{"qpc",i},
             {"kind","probe"},{"point","store-probe"},{"generation",1}},blob.data(),blob.size());
+            if(i==2||i==4)store.Flush();}
         store.Close(uc::Json::array(),"STOPPED_CLEAN");
         std::cout<<uc::Json{{"ok",true},{"directory",store.Path()},{"status",store.Status()}}.dump()<<std::endl;
         return 0;

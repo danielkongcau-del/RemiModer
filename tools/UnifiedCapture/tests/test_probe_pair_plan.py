@@ -93,7 +93,9 @@ class ProbePairPlanTests(unittest.TestCase):
     def test_return_address_retention_is_explicit_bounded_and_entry_only(self):
         value = self.make_plan(requirement="none")
         value["observations"][0]["retention"] = {
-            "mode": "first_per_entry_return_address", "max_keys": 1024}
+            "mode": "first_per_entry_return_address", "max_keys": 1024,
+            "exact_callers": [{"module": "fixture", "return_rva": 0x220,
+                               "evidence": ["fixture"]}]}
         self.assertEqual(len(compile_probe_pair(value).sites), 1)
         for capacity, message in ((0, "nonzero power"), (3, "power of two"), (131072, "<= 65536")):
             broken = copy.deepcopy(value)
@@ -102,14 +104,47 @@ class ProbePairPlanTests(unittest.TestCase):
                 compile_probe_pair(broken)
         paired = self.make_plan(requirement="completion")
         paired["observations"][0]["retention"] = value["observations"][0]["retention"]
-        with self.assertRaisesRegex(ValueError, "entry-only"):
-            compile_probe_pair(paired)
+        self.assertEqual(len(compile_probe_pair(paired).sites), 2)
+        ungated_pair = copy.deepcopy(paired)
+        del ungated_pair["observations"][0]["retention"]["exact_callers"]
+        with self.assertRaisesRegex(ValueError, "requires an exact caller gate"):
+            compile_probe_pair(ungated_pair)
         predicated = copy.deepcopy(value)
         predicated["observations"][0]["entry"]["reads"] = [{"id": "receiver", "base": "rcx",
             "op": "scalar", "width": 8, "phase": "enter", "when": {"op": "neq", "value": 0},
             "evidence": ["fixture"]}]
         with self.assertRaisesRegex(ValueError, "cannot be combined"):
             compile_probe_pair(predicated)
+        duplicate = copy.deepcopy(value)
+        duplicate["observations"][0]["retention"]["exact_callers"] *= 2
+        with self.assertRaisesRegex(ValueError, "duplicate exact caller"):
+            compile_probe_pair(duplicate)
+        missing_evidence = copy.deepcopy(value)
+        missing_evidence["observations"][0]["retention"]["exact_callers"][0]["evidence"] = []
+        with self.assertRaisesRegex(ValueError, "lacks existing evidence"):
+            compile_probe_pair(missing_evidence)
+
+    def test_composite_retention_uses_only_bounded_raw_key_parts(self):
+        value = self.make_plan(requirement="none")
+        value["observations"][0]["retention"] = {
+            "mode": "first_per_composite_key", "max_keys": 1024,
+            "key": [
+                {"kind": "entry_return_address", "evidence": ["fixture"]},
+                {"kind": "register", "register": "rcx", "mask": 0xfffffffffffffff0,
+                 "evidence": ["fixture"]},
+            ],
+        }
+        self.assertEqual(len(compile_probe_pair(value).sites), 1)
+        for mutation, message in ((lambda key: key.reverse(), "must begin"),
+                                  (lambda key: key.append(copy.deepcopy(key[-1])), "duplicate")):
+            broken = copy.deepcopy(value)
+            mutation(broken["observations"][0]["retention"]["key"])
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                compile_probe_pair(broken)
+        missing = copy.deepcopy(value)
+        missing["observations"][0]["retention"]["key"][1]["evidence"] = []
+        with self.assertRaisesRegex(ValueError, "lacks existing evidence"):
+            compile_probe_pair(missing)
 
     def test_partial_overlap_rejected(self):
         value = self.make_plan(2)
@@ -198,6 +233,39 @@ class ProbePairPlanTests(unittest.TestCase):
              "phase": "leave", "evidence": ["fixture"]})
         with self.assertRaisesRegex(ValueError, "per-phase"):
             compile_probe_pair(value)
+
+    def test_register_value_read_and_predicate_do_not_dereference(self):
+        value = self.make_plan()
+        value["observations"][0]["entry"]["reads"] = [
+            {"id": "parameter-id", "base": "rdx", "op": "register", "width": 4,
+             "phase": "enter", "when": {"op": "eq", "value": 0x1234},
+             "evidence": ["fixture"]},
+            {"id": "receiver-after", "base": "entry:rcx", "op": "register", "width": 8,
+             "phase": "leave", "evidence": ["fixture"]},
+        ]
+        self.assertEqual(len(compile_probe_pair(value).sites), 2)
+        for mutate, message in (
+            (lambda read: read.update(base="global"), "current/entry register"),
+            (lambda read: read.update(offset=1), "zero offset"),
+        ):
+            broken = copy.deepcopy(value)
+            mutate(broken["observations"][0]["entry"]["reads"][0])
+            with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
+                compile_probe_pair(broken)
+
+    def test_bounded_in_predicate(self):
+        value = self.make_plan()
+        value["observations"][0]["entry"]["reads"] = [
+            {"id": "parameter-id", "base": "rdx", "op": "register", "width": 4,
+             "phase": "enter", "when": {"op": "in", "values": [1, 3, 5]},
+             "evidence": ["fixture"]},
+        ]
+        self.assertEqual(len(compile_probe_pair(value).sites), 2)
+        for values in ([], [1] * 2, list(range(17))):
+            broken = copy.deepcopy(value)
+            broken["observations"][0]["entry"]["reads"][0]["when"]["values"] = values
+            with self.subTest(values=len(values)), self.assertRaisesRegex(ValueError, "1..16 unique"):
+                compile_probe_pair(broken)
 
     def test_resource_and_redirect_contracts_match_native_compiler(self):
         for mutate, message in (

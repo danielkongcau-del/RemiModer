@@ -137,10 +137,12 @@ def validate(plan: dict, *, verify_sources=False) -> dict:
             if phase not in ("enter", "leave", "both") or (backend == "gum_probe" and phase != "enter"):
                 raise ValueError("invalid read phase")
             op = read.get("op", "scalar")
-            if op in ("scalar", "relative"):
+            if op in ("scalar", "relative", "register"):
                 size = read.get("width", 8)
                 if size not in (1, 2, 4, 8):
                     raise ValueError("scalar width")
+                if op == "register" and (base not in REGISTERS or read.get("offset", 0) != 0):
+                    raise ValueError("register read requires a raw register base and zero offset")
             elif op == "block":
                 size = uint(read["size"], "block size", (1 << 32) - 1)
                 if not size:
@@ -161,18 +163,25 @@ def validate(plan: dict, *, verify_sources=False) -> dict:
                 raise ValueError("unknown read operation")
             when = read.get("when")
             if when is not None:
-                if not isinstance(when, dict) or when.get("op") not in ("eq", "neq"):
-                    raise ValueError("predicate op must be eq/neq")
-                uint(when.get("value"), "predicate value")
+                if not isinstance(when, dict) or when.get("op") not in ("eq", "neq", "in"):
+                    raise ValueError("predicate op must be eq/neq/in")
+                if when.get("op") == "in":
+                    values = when.get("values")
+                    if not isinstance(values, list) or not 1 <= len(values) <= 16 or len(set(values)) != len(values):
+                        raise ValueError("predicate in requires 1..16 unique values")
+                    for value in values:
+                        uint(value, "predicate values")
+                else:
+                    uint(when.get("value"), "predicate value")
                 if "mask" in when:
                     uint(when["mask"], "predicate mask")
-                if op not in ("scalar", "relative") or phase != "enter":
-                    raise ValueError("predicate requires an enter-phase scalar/relative read")
+                if op not in ("scalar", "relative", "register") or phase != "enter":
+                    raise ValueError("predicate requires an enter-phase scalar/relative/register read")
             if not read.get("evidence") or any(item not in sources for item in read["evidence"]):
                 raise ValueError("read operation lacks evidence")
             for dependency in ([base] if base in available else []) + ([read["count_from"]] if op == "array" else []):
                 prior = available[dependency]
-                if prior.get("op", "scalar") not in ("scalar", "relative"):
+                if prior.get("op", "scalar") not in ("scalar", "relative", "register"):
                     raise ValueError("read dependency is not a scalar")
                 phases = {"enter": {1}, "leave": {2}, "both": {1, 2}}
                 if not phases[phase] <= phases[prior.get("phase", "both")]:
@@ -181,12 +190,53 @@ def validate(plan: dict, *, verify_sources=False) -> dict:
             available[rid] = read
         retention = point.get("retention")
         if retention is not None:
-            if backend != "gum_probe" or not isinstance(retention, dict) or \
-                    retention.get("mode") != "first_per_entry_return_address":
-                raise ValueError("return-address retention requires an entry-only instruction probe")
+            mode = retention.get("mode") if isinstance(retention, dict) else None
+            if backend != "gum_probe" or mode not in (
+                    "first_per_entry_return_address", "first_per_composite_key"):
+                raise ValueError("raw-key retention requires an entry-only instruction probe")
             capacity = uint(retention.get("max_keys"), "retention max_keys", 65536)
             if not capacity or capacity & (capacity - 1):
                 raise ValueError("retention max_keys must be a nonzero power of two")
+            key = retention.get("key")
+            if mode == "first_per_entry_return_address":
+                if key is not None:
+                    raise ValueError("legacy return-address retention cannot declare a composite key")
+            else:
+                if not isinstance(key, list) or not 2 <= len(key) <= 4:
+                    raise ValueError("composite retention key must contain 2..4 raw parts")
+                identities = set()
+                for index, part in enumerate(key):
+                    if not isinstance(part, dict) or part.get("kind") not in (
+                            "entry_return_address", "register"):
+                        raise ValueError("composite retention key part")
+                    if index == 0 and part["kind"] != "entry_return_address":
+                        raise ValueError("composite retention key must begin with entry_return_address")
+                    register = part.get("register") if part["kind"] == "register" else None
+                    if part["kind"] == "register" and register not in REGISTERS:
+                        raise ValueError("composite retention key register")
+                    identity = (part["kind"], register)
+                    if identity in identities:
+                        raise ValueError("duplicate composite retention key part")
+                    identities.add(identity)
+                    if "mask" in part:
+                        uint(part["mask"], "composite retention key mask")
+                    refs = part.get("evidence", [])
+                    if not refs or any(ref not in sources for ref in refs):
+                        raise ValueError("composite retention key lacks existing evidence")
+            callers = retention.get("exact_callers", [])
+            if not isinstance(callers, list) or len(callers) > 256:
+                raise ValueError("retention exact_callers must contain at most 256 rows")
+            identities = set()
+            for caller in callers:
+                if not isinstance(caller, dict) or caller.get("module") not in modules:
+                    raise ValueError("exact caller module")
+                identity = (caller["module"], uint(caller.get("return_rva"), "exact caller return_rva"))
+                if identity in identities:
+                    raise ValueError("duplicate exact caller")
+                identities.add(identity)
+                refs = caller.get("evidence", [])
+                if not refs or any(ref not in sources for ref in refs):
+                    raise ValueError("exact caller lacks existing evidence")
             if any("when" in read for read in point.get("reads", [])):
                 raise ValueError("return-address retention cannot be combined with read predicates")
         if total > resources["max_record_bytes"]:

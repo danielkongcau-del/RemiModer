@@ -20,7 +20,13 @@ PairRuntimeRecursive PROC FRAME
     test edx, edx
     jz PairRuntimeRecursiveBase
     dec edx
+    ; Keep the recursive call/continuation reservation disjoint from the
+    ; 16-byte entry reservation used by the probe backend.
+    db 16 dup (090h)
     call PairRuntimeRecursive
+    ; Dedicated source-safe continuation window for exercising the
+    ; caller-continuation backend. No branch enters its interior.
+    db 16 dup (090h)
     inc rax
     jmp PairRuntimeRecursiveDone
 PairRuntimeRecursiveBase:

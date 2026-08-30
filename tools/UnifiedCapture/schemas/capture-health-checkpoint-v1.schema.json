@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "uc.CaptureHealthCheckpoint.v1",
+  "type": "object",
+  "required": ["kind", "schema", "qpc", "loss", "point_metrics", "storage", "snapshot_atomic"],
+  "properties": {
+    "kind": {"const": "loss_checkpoint"},
+    "schema": {"const": "uc.CaptureHealthCheckpoint.v1"},
+    "qpc": {"type": "integer", "minimum": 0},
+    "loss": {"type": "array"},
+    "point_metrics": {"type": "array"},
+    "storage": {"type": "object"},
+    "snapshot_atomic": {"const": false}
+  },
+  "additionalProperties": true
+}

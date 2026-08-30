@@ -6,8 +6,8 @@ import json
 from pathlib import Path
 from typing import Any
 
-from .model import canonical, file_hash, sha, uint
-from .native_manifest import validate_exit_manifest
+from .model import REGISTERS, canonical, file_hash, sha, uint
+from .native_manifest import NativePE, validate_exit_manifest
 
 
 SCHEMA = "uc.capture-plan.v2"
@@ -124,16 +124,18 @@ def _validate_reads(reads: Any, sources: dict, modules: dict, max_bytes: int, na
         if entry_register and phase != "leave":
             raise ValueError(f"{name}: entry register base is leave-phase only")
         if base in ids:
-            if ids[base][0] not in ("scalar", "relative"):
-                raise ValueError(f"{name}: read dependency must be scalar/relative")
+            if ids[base][0] not in ("scalar", "relative", "register"):
+                raise ValueError(f"{name}: read dependency must be scalar/relative/register")
             if ids[base][1] != phase:
                 raise ValueError(f"{name}: read dependency unavailable at selected phase")
         uint(read.get("offset", 0), f"{name}.offset")
         op = read.get("op", "scalar")
-        if op in ("scalar", "relative"):
+        if op in ("scalar", "relative", "register"):
             size = uint(read.get("width", 8), f"{name}.width", 8)
             if size not in (1, 2, 4, 8):
                 raise ValueError(f"{name}: scalar width")
+            if op == "register" and ((base not in registers and not entry_register) or read.get("offset", 0) != 0):
+                raise ValueError(f"{name}: register read requires a current/entry register base and zero offset")
         elif op == "block":
             size = uint(read.get("size"), f"{name}.size", max_bytes)
             if not size:
@@ -145,8 +147,8 @@ def _validate_reads(reads: Any, sources: dict, modules: dict, max_bytes: int, na
         elif op == "array":
             if read.get("count_from") not in ids:
                 raise ValueError(f"{name}: array count must refer to an earlier read")
-            if ids[read["count_from"]][0] not in ("scalar", "relative"):
-                raise ValueError(f"{name}: array count dependency must be scalar/relative")
+            if ids[read["count_from"]][0] not in ("scalar", "relative", "register"):
+                raise ValueError(f"{name}: array count dependency must be scalar/relative/register")
             if ids[read["count_from"]][1] != phase:
                 raise ValueError(f"{name}: array count dependency unavailable at selected phase")
             stride = uint(read.get("stride"), f"{name}.stride")
@@ -155,16 +157,23 @@ def _validate_reads(reads: Any, sources: dict, modules: dict, max_bytes: int, na
                 raise ValueError(f"{name}: zero array stride/count bound")
             size = stride * max_count
         else:
-            raise ValueError(f"{name}: v2 probe-pair supports scalar/relative/block/string/array reads")
+            raise ValueError(f"{name}: v2 probe-pair supports scalar/relative/register/block/string/array reads")
         when = read.get("when")
         if when is not None:
-            if not isinstance(when, dict) or when.get("op") not in ("eq", "neq"):
-                raise ValueError(f"{name}: predicate op must be eq/neq")
-            uint(when.get("value"), f"{name}.predicate.value")
+            if not isinstance(when, dict) or when.get("op") not in ("eq", "neq", "in"):
+                raise ValueError(f"{name}: predicate op must be eq/neq/in")
+            if when.get("op") == "in":
+                values = when.get("values")
+                if not isinstance(values, list) or not 1 <= len(values) <= 16 or len(set(values)) != len(values):
+                    raise ValueError(f"{name}: predicate in requires 1..16 unique values")
+                for value in values:
+                    uint(value, f"{name}.predicate.values")
+            else:
+                uint(when.get("value"), f"{name}.predicate.value")
             if "mask" in when:
                 uint(when["mask"], f"{name}.predicate.mask")
-            if op not in ("scalar", "relative") or phase != "enter":
-                raise ValueError(f"{name}: predicate requires an enter-phase scalar/relative read")
+            if op not in ("scalar", "relative", "register") or phase != "enter":
+                raise ValueError(f"{name}: predicate requires an enter-phase scalar/relative/register read")
         totals[phase] += size
         if totals[phase] > max_bytes:
             raise ValueError(f"{name}: read program exceeds per-phase max_record_bytes")
@@ -198,6 +207,129 @@ def _eligible_candidate(candidate: dict, requirement: str, build_hash: str, name
     return expected, span, patch_hash
 
 
+def _module_images(modules: dict, sources: dict) -> dict[str, NativePE]:
+    """Resolve immutable module files only when continuation proof needs them."""
+    result: dict[str, NativePE] = {}
+    for alias, module in modules.items():
+        matches = [Path(source["path"]) for source in sources.values()
+                   if source.get("sha256") == module.get("sha256")]
+        if len(matches) != 1:
+            raise ValueError(f"{alias}: caller continuation needs one source with the module hash")
+        result[alias] = NativePE(matches[0])
+    return result
+
+
+def _verify_caller_continuations(plan: dict, modules: dict, sources: dict) -> dict[tuple[str, str], list[dict]]:
+    """Mechanically verify caller-return sites before any plan is published.
+
+    This proves a bounded statement only: an observed callee entry return
+    address has a unique predecessor call, and the selected continuation owns
+    a relocatable instruction window with no decoded direct edge into its
+    interior.  It is not a complete callee exit proof.
+    """
+    observations = [row for row in plan.get("observations", []) if row.get("completion") is not None]
+    if not observations:
+        return {}
+    images = _module_images(modules, sources)
+    all_interiors: dict[str, set[int]] = {alias: set() for alias in images}
+    rows: dict[tuple[str, str], list[dict]] = {}
+    for observation in observations:
+        oid = observation.get("id", "<unknown>")
+        completion = observation.get("completion")
+        if not isinstance(completion, dict) or completion.get("mode") != "caller_continuation":
+            raise ValueError(f"{oid}: unsupported completion mode")
+        sites = completion.get("sites")
+        if not isinstance(sites, list) or not sites or len(sites) > 256:
+            raise ValueError(f"{oid}: caller continuation sites must contain 1..256 rows")
+        seen: set[tuple[str, int]] = set()
+        verified = []
+        for site in sites:
+            name = f"{oid}/{site.get('id', '<unknown>')}"
+            if not isinstance(site, dict) or not isinstance(site.get("id"), str) or not site["id"]:
+                raise ValueError(f"{oid}: caller continuation site id")
+            module = site.get("module")
+            if module not in modules:
+                raise ValueError(f"{name}: unknown caller module")
+            refs = site.get("evidence", [])
+            if not refs or any(ref not in sources for ref in refs):
+                raise ValueError(f"{name}: continuation lacks existing evidence")
+            return_rva = uint(site.get("return_rva"), f"{name}.return_rva")
+            identity = (module, return_rva)
+            if identity in seen:
+                raise ValueError(f"{oid}: duplicate caller continuation")
+            seen.add(identity)
+            image = images[module]
+            if return_rva >= image.size_of_image:
+                raise ValueError(f"{name}: caller continuation outside module")
+            expected = _verified_source_prefix(site.get("expected_prefix"), f"{name}.expected_prefix")
+            if image.bytes_at(return_rva, len(expected)) != expected:
+                raise ValueError(f"{name}: continuation source prefix mismatch")
+            build_hash, span, patch_hash = _patch_contract(
+                site.get("backend_patch_contract"), expected, name)
+            patch = site["backend_patch_contract"]
+            if patch.get("probe_rva") not in (None, return_rva):
+                raise ValueError(f"{name}: patch contract RVA mismatch")
+            source_contract = site.get("source_contract", {})
+            semantic_span = uint(source_contract.get("semantic_safe_span"),
+                                 f"{name}.source_contract.semantic_safe_span", len(expected))
+            if semantic_span < 16 or semantic_span > len(expected):
+                raise ValueError(f"{name}: continuation semantic safe span")
+            if source_contract.get("instruction_boundary_verified_by") != "capstone" or \
+                    source_contract.get("predecessor_call_ends_at_return_rva") is not True or \
+                    source_contract.get("relocation_window_instruction_complete") is not True or \
+                    source_contract.get("direct_interior_edge_free") is not True:
+                raise ValueError(f"{name}: incomplete continuation source contract")
+            owner = image.containing(return_rva - 1) if return_rva else None
+            if owner is None:
+                raise ValueError(f"{name}: no pdata owner for predecessor call")
+            instructions = image.decode(owner)["instructions"]
+            predecessors = [ins for ins in instructions if ins["rva"] + ins["size"] == return_rva]
+            if len(predecessors) != 1 or predecessors[0]["mnemonic"] != "call" or \
+                    "call" not in predecessors[0].get("groups", []):
+                raise ValueError(f"{name}: unique predecessor call not mechanically verified")
+            predecessor = predecessors[0]
+            declared = site.get("predecessor_call", {})
+            expected_predecessor = {
+                "callsite_rva": predecessor["rva"], "instruction_size": predecessor["size"],
+                "instruction_bytes": predecessor["bytes"],
+                "call_kind": "direct" if predecessor.get("direct_target_rva") is not None else "indirect",
+            }
+            if any(declared.get(key) != value for key, value in expected_predecessor.items()):
+                raise ValueError(f"{name}: predecessor call declaration differs from module bytes")
+            by_rva = {ins["rva"]: ins for ins in instructions}
+            cursor = return_rva
+            while cursor < return_rva + semantic_span:
+                instruction = by_rva.get(cursor)
+                if instruction is None:
+                    raise ValueError(f"{name}: continuation safe span is not whole instructions")
+                cursor += instruction["size"]
+            if cursor != return_rva + semantic_span:
+                raise ValueError(f"{name}: continuation safe span ends inside an instruction")
+            all_interiors[module].update(range(return_rva + 1, return_rva + semantic_span))
+            contract = site.get("capture_contract", {})
+            required = {
+                "probe_semantics": "pre_instruction",
+                "completion_semantics": "normal_return_to_observed_callsite_continuation",
+                "same_thread_pairing": True,
+                "exceptional_exit_observed": False,
+                "return_value_stable": True,
+                "xmm_return_stable": True,
+            }
+            if any(contract.get(key) != value for key, value in required.items()):
+                raise ValueError(f"{name}: caller continuation capture contract")
+            verified.append({"site": site, "expected": expected, "span": span,
+                             "build": build_hash, "patch": patch_hash})
+        rows[(oid, "caller_continuation")] = verified
+    for module, targets in all_interiors.items():
+        if not targets:
+            continue
+        edges = images[module].direct_control_xrefs(targets)
+        if edges:
+            first = edges[0]
+            raise ValueError(f"caller continuation direct interior edge: {module}+{first['target_rva']:#x}")
+    return rows
+
+
 def compile_probe_pair(plan: dict, *, verify_sources: bool = True) -> CompiledProbePairPlan:
     """Compile v2 without installing hooks; failures are publication blockers."""
     _integer_only(plan)
@@ -223,6 +355,7 @@ def compile_probe_pair(plan: dict, *, verify_sources: bool = True) -> CompiledPr
         sha(source.get("sha256"))
         if verify_sources and file_hash(Path(source["path"])) != source["sha256"]:
             raise ValueError(f"source changed: {source['path']}")
+    continuation_rows = _verify_caller_continuations(plan, modules, sources)
     resources = plan.get("resources", {})
     max_bytes = uint(resources.get("max_record_bytes"), "max_record_bytes", (1 << 32) - 1)
     if not max_bytes:
@@ -259,13 +392,55 @@ def compile_probe_pair(plan: dict, *, verify_sources: bool = True) -> CompiledPr
 
         retention = observation.get("retention")
         if retention is not None:
-            if not isinstance(retention, dict) or retention.get("mode") != "first_per_entry_return_address":
+            mode = retention.get("mode") if isinstance(retention, dict) else None
+            if mode not in ("first_per_entry_return_address", "first_per_composite_key"):
                 raise ValueError(f"{oid}: unsupported retention mode")
             capacity = uint(retention.get("max_keys"), f"{oid}.retention.max_keys", 65536)
             if not capacity or capacity & (capacity - 1):
                 raise ValueError(f"{oid}: retention max_keys must be a nonzero power of two")
-            if requirement != "none":
-                raise ValueError(f"{oid}: return-address retention is entry-only")
+            key = retention.get("key")
+            if mode == "first_per_entry_return_address":
+                if key is not None:
+                    raise ValueError(f"{oid}: legacy return-address retention cannot declare a composite key")
+            else:
+                if not isinstance(key, list) or not 2 <= len(key) <= 4:
+                    raise ValueError(f"{oid}: composite retention key must contain 2..4 raw parts")
+                identities = set()
+                for index, part in enumerate(key):
+                    if not isinstance(part, dict) or part.get("kind") not in (
+                            "entry_return_address", "register"):
+                        raise ValueError(f"{oid}: composite retention key part")
+                    if index == 0 and part["kind"] != "entry_return_address":
+                        raise ValueError(f"{oid}: composite retention key must begin with entry_return_address")
+                    register = part.get("register") if part["kind"] == "register" else None
+                    if part["kind"] == "register" and register not in REGISTERS:
+                        raise ValueError(f"{oid}: composite retention key register")
+                    identity = (part["kind"], register)
+                    if identity in identities:
+                        raise ValueError(f"{oid}: duplicate composite retention key part")
+                    identities.add(identity)
+                    if "mask" in part:
+                        uint(part["mask"], f"{oid}.retention.key.mask")
+                    refs = part.get("evidence", [])
+                    if not refs or any(ref not in sources for ref in refs):
+                        raise ValueError(f"{oid}: composite retention key lacks existing evidence")
+            callers = retention.get("exact_callers", [])
+            if not isinstance(callers, list) or len(callers) > 256:
+                raise ValueError(f"{oid}: retention exact_callers must contain at most 256 rows")
+            identities = set()
+            for caller in callers:
+                if not isinstance(caller, dict) or caller.get("module") not in modules:
+                    raise ValueError(f"{oid}: exact caller module")
+                identity = (caller["module"], uint(caller.get("return_rva"),
+                                                    f"{oid}.retention.exact_callers.return_rva"))
+                if identity in identities:
+                    raise ValueError(f"{oid}: duplicate exact caller")
+                identities.add(identity)
+                refs = caller.get("evidence", [])
+                if not refs or any(ref not in sources for ref in refs):
+                    raise ValueError(f"{oid}: exact caller lacks existing evidence")
+            if requirement != "none" and not callers:
+                raise ValueError(f"{oid}: probe-pair retention requires an exact caller gate")
 
         entry = observation.get("entry", {})
         entry_rva = uint(entry.get("rva"), f"{oid}.entry.rva")
@@ -296,7 +471,25 @@ def compile_probe_pair(plan: dict, *, verify_sources: bool = True) -> CompiledPr
         if function.get("module") != module or function.get("entry_rva") != entry_rva:
             raise ValueError(f"{oid}: entry does not match native exit manifest")
         site_rows[-1]["subscription"] = LogicalSubscription(oid, "entry", function_id, None)
+        completion = observation.get("completion")
         if requirement == "none":
+            if completion is not None:
+                raise ValueError(f"{oid}: entry-only observation cannot declare completion sites")
+            continue
+        if completion is not None:
+            callers = {(row["module"], int(row["return_rva"]))
+                       for row in (retention or {}).get("exact_callers", [])}
+            sites = {(row["site"]["module"], int(row["site"]["return_rva"]))
+                     for row in continuation_rows[(oid, "caller_continuation")]}
+            if callers != sites:
+                raise ValueError(f"{oid}: exact caller gates and continuation sites must match exactly")
+            for row in continuation_rows[(oid, "caller_continuation")]:
+                site = row["site"]
+                site_rows.append({"module": site["module"], "rva": site["return_rva"],
+                                  "span": row["span"], "expected": row["expected"],
+                                  "build": row["build"], "patch": row["patch"],
+                                  "subscription": LogicalSubscription(
+                                      oid, "caller_continuation", function_id, site["id"])})
             continue
         complete = function.get("completeness", {})
         if complete.get("normal_exit_set_complete") is not True or complete.get("cold_fragments_complete") is not True:

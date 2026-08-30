@@ -10,7 +10,7 @@ from uc.cli import run_main
 from uc.caller import entry_return_address, resolve_callsite
 from uc.model import canonical, file_hash
 from uc.native_manifest import NativePE
-from uc.store import decode_chunk_file, inspect_session, read_manifest
+from uc.store import decode_chunk_file, event_dictionary_context, inspect_session, read_manifest
 
 
 def load(path: Path) -> Any:
@@ -90,6 +90,54 @@ def _campaign_unit(run: Path, unit_id: str | None) -> Path:
     return selected
 
 
+def _raw_probe_complete(event: dict[str, Any], observation: dict[str, Any]) -> bool:
+    """Check the ABI/read evidence the immutable observation actually requested.
+
+    A plan selecting GPR values must not be rejected merely because it did not
+    request a stack window or XMM state.  Conversely, this never manufactures
+    those absent evidence classes.
+    """
+    if event.get("kind") != "probe" or event.get("read_failures") != 0 \
+            or event.get("truncated") != 0:
+        return False
+    raw_abi = event.get("raw_abi", {})
+    if not isinstance(raw_abi.get("register_mask"), int):
+        return False
+    actual = {row.get("id"): row for row in event.get("reads", [])}
+    for requested in observation.get("reads", []):
+        if requested.get("phase", "enter") != "enter":
+            continue
+        row = actual.get(requested.get("id"))
+        if row is None or row.get("status") != 1:
+            return False
+        expected = requested.get("width") if requested.get("op") in ("register", "scalar") \
+            else requested.get("size") if requested.get("op") == "block" else None
+        if expected is not None and row.get("length") != expected:
+            return False
+    return True
+
+
+def _retained_return_address(event: dict[str, Any]) -> dict[str, Any] | None:
+    key = event.get("retention_key", {})
+    value = (key.get("value") if key.get("kind") == "entry_return_address"
+             else key.get("entry_return_address") if key.get("kind") == "composite" else None)
+    if not isinstance(value, int):
+        return None
+    return {"return_address": value,
+            "source": "runtime-captured-architectural-entry-return-address",
+            "retention_lane": key.get("lane"),
+            "stack_slot_matches_rsp": "NOT_SEPARATELY_CAPTURED"}
+
+
+def _retention_identity(row: dict[str, Any]) -> tuple | None:
+    parts = row.get("key_parts") if "key_parts" in row else row.get("parts")
+    if isinstance(parts, list) and parts:
+        return tuple((part.get("kind"), part.get("register"), part.get("mask"), part.get("value"))
+                     for part in parts)
+    value = row.get("entry_return_address", row.get("value"))
+    return ("entry_return_address", None, None, value) if isinstance(value, int) else None
+
+
 def analyze_run(run: Path, out: Path, ledger_path: Path | None = None,
                 unit_id: str | None = None) -> dict[str, Any]:
     run, out = run.resolve(), out.resolve()
@@ -103,6 +151,7 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None,
     session = Path(finish.get("directory") or activation["directory"]).resolve()
     inspection = inspect_session(session)
     manifest, manifest_errors = read_manifest(session / "session.manifest")
+    dictionary_context = event_dictionary_context(session / "session.manifest", manifest)
     session_header = next(row for row in manifest if row.get("kind") == "session")
     activation_rows = [row for row in manifest if row.get("kind") == "plan_activation"
                        and row.get("generation") == result["generation"]]
@@ -117,18 +166,6 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None,
         begin = max(armed);ends = [qpc for qpc in completed if qpc >= begin]
         if ends:
             window = [begin, min(ends)]
-    all_events = []
-    event_blobs: dict[int, bytes] = {}
-    events_by_point: dict[str, list] = {}
-    chunks = []
-    for chunk in inspection["chunks"]:
-        path = session / chunk["file"]
-        chunks.append({"path": str(path), "sha256": file_hash(path)})
-        _, rows = decode_chunk_file(path)
-        for _, _, event, blob in rows:
-            all_events.append(event)
-            event_blobs[event["event_id"]] = blob
-            events_by_point.setdefault(event.get("point"), []).append(event)
     generation = result["generation"]
     coverage = [row for row in manifest if row.get("kind") == "coverage" and row.get("generation") == generation]
     session_end = next((row for row in reversed(manifest) if row.get("kind") == "session_end"), {})
@@ -151,6 +188,87 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None,
         source_path = Path(source["path"])
         if source_path.is_file() and file_hash(source_path) == source.get("sha256"):
             module_images[module_alias] = NativePE(source_path)
+    observations_by_point = {row["id"]: row for row in plan["observations"]}
+    point_states: dict[str, dict[str, Any]] = {}
+    for point, observation in observations_by_point.items():
+        point_states[point] = {
+            "activation_count": 0, "window_count": 0, "event_ids": [],
+            "raw_activation_seen": False, "raw_activation_complete": True,
+            "raw_window_seen": False, "raw_window_complete": True,
+            "caller_by_return": {}, "retention_sample_keys": set(), "retention_aggregate_seen": set(),
+        }
+    retention_by_point = {
+        row.get("point"): row for row in retention_rows if row.get("generation") == generation
+    }
+    retention_keys_by_point = {
+        point: {_retention_identity(row): row for row in summary.get("keys", [])}
+        for point, summary in retention_by_point.items()
+    }
+    chunks = []
+    for chunk in inspection["chunks"]:
+        path = session / chunk["file"]
+        chunks.append({"path": str(path), "sha256": file_hash(path)})
+        _, rows = decode_chunk_file(path, dictionary_context=dictionary_context)
+        for _, _, event, blob in rows:
+            if event.get("generation") != generation:
+                continue
+            point = event.get("point")
+            state = point_states.get(point)
+            if state is None:
+                continue
+            state["activation_count"] += 1
+            observation = observations_by_point[point]
+            raw_ok = _raw_probe_complete(event, observation)
+            state["raw_activation_seen"] = True
+            state["raw_activation_complete"] &= raw_ok
+            in_window = window is not None and window[0] <= event["qpc"] <= window[1]
+            if in_window:
+                state["window_count"] += 1
+                if len(state["event_ids"]) < 64:
+                    state["event_ids"].append(event["event_id"])
+                state["raw_window_seen"] = True
+                state["raw_window_complete"] &= raw_ok
+            retention_policy = observation.get("retention")
+            if retention_policy:
+                retention_key = event.get("retention_key", {})
+                identity = _retention_identity(retention_key)
+                if identity is not None:
+                    state["retention_sample_keys"].add(identity)
+            if not (raw_ok and (retention_policy or in_window)):
+                continue
+            binding = bindings_by_point.get(point)
+            image = module_images.get(binding.get("module")) if binding else None
+            if binding is None or image is None:
+                continue
+            observed = _retained_return_address(event) if retention_policy else entry_return_address(event, blob)
+            if observed is None:
+                continue
+            return_address = observed["return_address"]
+            aggregate_identity = _retention_identity(event.get("retention_key", {})) if retention_policy else None
+            aggregate = retention_keys_by_point.get(point, {}).get(aggregate_identity)
+            prior = state["caller_by_return"].get(return_address)
+            if prior is not None:
+                if retention_policy and aggregate_identity not in state["retention_aggregate_seen"]:
+                    prior["observation_count"] += int((aggregate or {}).get("count", 0))
+                    prior["first_qpc"] = min(prior["first_qpc"], (aggregate or {}).get("first_qpc", event["qpc"]))
+                    prior["last_qpc"] = max(prior["last_qpc"], (aggregate or {}).get("last_qpc", event["qpc"]))
+                    state["retention_aggregate_seen"].add(aggregate_identity)
+                elif not retention_policy:
+                    prior["observation_count"] += 1
+                    prior["first_qpc"] = min(prior["first_qpc"], event["qpc"])
+                    prior["last_qpc"] = max(prior["last_qpc"], event["qpc"])
+                continue
+            resolved = resolve_callsite(observed, binding, image)
+            resolved["module"] = binding.get("module")
+            resolved["representative_event_id"] = event["event_id"]
+            resolved["observation_count"] = aggregate["count"] if aggregate else 1
+            resolved["first_qpc"] = aggregate["first_qpc"] if aggregate else event["qpc"]
+            resolved["last_qpc"] = aggregate["last_qpc"] if aggregate else event["qpc"]
+            _annotate_observed_target(resolved, binding, bindings_by_point)
+            _annotate_observed_caller(resolved, binding, bindings_by_point)
+            state["caller_by_return"][return_address] = resolved
+            if aggregate_identity is not None:
+                state["retention_aggregate_seen"].add(aggregate_identity)
     global_checks = {
         "process_binding_match": intent["pid"] == session_header.get("pid")
             == qualified_process.get("pid") == process_binding.get("pid"),
@@ -168,30 +286,19 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None,
     points = []
     for observation in plan["observations"]:
         point = observation["id"]
-        events = [event for event in events_by_point.get(point, ())
-                  if event.get("generation") == generation
-                  and (window is None or window[0] <= event["qpc"] <= window[1])]
+        state = point_states[point]
         covered = any(row.get("point") == point and row.get("complete") is True for row in coverage)
         losses = [row for row in loss_rows if row.get("point") == point and row.get("generation") == generation]
         lossless = len(losses) == 1 and all(losses[0].get(key) == 0 for key in
             ("events", "bytes", "unknown_byte_records", "read_failures", "truncated")) and all(
             value.get("occurrences") == 0 for value in losses[0].get("reasons", {}).values())
         retention_policy = observation.get("retention")
-        all_point_events = [event for event in events_by_point.get(point, ())
-                            if event.get("generation") == generation]
-        raw_events = all_point_events if retention_policy else events
-        retention_generation = next((row for row in reversed(retention_rows)
-                                     if row.get("point") == point and row.get("generation") == generation), None)
-        sample_keys = {event.get("retention_key", {}).get("value") for event in raw_events
-                       if event.get("retention_key", {}).get("kind") == "entry_return_address"}
-        required_keys = {row.get("entry_return_address") for row in (retention_generation or {}).get("keys", [])}
-        raw = bool(raw_events) and all(event.get("kind") == "probe"
-            and event.get("raw_abi", {}).get("register_mask") == 131071
-            and event.get("raw_abi", {}).get("xmm_mask") == 65535
-            and event.get("read_failures") == 0 and event.get("truncated") == 0
-            and any(read.get("id") == "raw-entry-stack-window" and read.get("status") == 1
-                    and read.get("length") == 128 for read in event.get("reads", []))
-            for event in raw_events) and (not retention_policy or required_keys <= sample_keys)
+        retention_generation = retention_by_point.get(point)
+        required_keys = {_retention_identity(row) for row in (retention_generation or {}).get("keys", [])}
+        raw = ((state["raw_activation_seen"] and state["raw_activation_complete"]
+                and required_keys <= state["retention_sample_keys"])
+               if retention_policy else
+               (state["raw_window_seen"] and state["raw_window_complete"]))
         if not clean_store or window is None or not covered or not lossless or (retention_policy and
                 (retention_generation is None or not retention_generation.get("complete_for_caller_counts"))):
             status = "UNKNOWN"
@@ -199,42 +306,17 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None,
             status = "OBSERVED_AGGREGATED_CALLERS"
         elif retention_policy and retention_generation["callbacks"]:
             status = "UNKNOWN_RAW_ABI_INCOMPLETE"
-        elif events and raw:
+        elif state["window_count"] and raw:
             status = "OBSERVED"
-        elif events:
+        elif state["window_count"]:
             status = "UNKNOWN_RAW_ABI_INCOMPLETE"
         else:
             status = "NOT_OBSERVED_IN_COVERED_WINDOW"
-        retention_by_return = {row["entry_return_address"]: row
-                               for row in (retention_generation or {}).get("keys", [])}
-        caller_by_return: dict[int, dict[str, Any]] = {}
-        binding = bindings_by_point.get(point)
-        image = module_images.get(binding.get("module")) if binding else None
-        if binding is not None and image is not None:
-            for event in raw_events:
-                observed = entry_return_address(event, event_blobs[event["event_id"]])
-                if observed is not None:
-                    return_address = observed["return_address"]
-                    prior = caller_by_return.get(return_address)
-                    if prior is not None:
-                        if retention_policy:
-                            continue
-                        prior["observation_count"] += 1
-                        prior["first_qpc"] = min(prior["first_qpc"], event["qpc"])
-                        prior["last_qpc"] = max(prior["last_qpc"], event["qpc"])
-                        continue
-                    resolved = resolve_callsite(observed, binding, image)
-                    resolved["representative_event_id"] = event["event_id"]
-                    aggregate = retention_by_return.get(return_address)
-                    resolved["observation_count"] = aggregate["count"] if aggregate else 1
-                    resolved["first_qpc"] = aggregate["first_qpc"] if aggregate else event["qpc"]
-                    resolved["last_qpc"] = aggregate["last_qpc"] if aggregate else event["qpc"]
-                    _annotate_observed_target(resolved, binding, bindings_by_point)
-                    _annotate_observed_caller(resolved, binding, bindings_by_point)
-                    caller_by_return[return_address] = resolved
+        caller_by_return = state["caller_by_return"]
         caller_evidence = [caller_by_return[key] for key in sorted(caller_by_return)]
         points.append({"point": point, "function_id": observation["native_exit_manifest"]["function_id"],
-            "status": status, "event_count": len(events), "event_ids": [event["event_id"] for event in events],
+            "status": status, "event_count": state["window_count"],
+            "event_ids": state["event_ids"], "event_ids_complete": state["window_count"] <= 64,
             "coverage_complete": covered, "lossless": lossless, "raw_abi_complete": raw,
             "evidence_scope": "activation_generation" if retention_policy else "marked_window",
             "retention_generation": ({**retention_generation, "scope": "activation_generation",
@@ -265,7 +347,7 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None,
         edge["callsite_rvas"] = sorted(set(edge["callsite_rvas"]))
     accepted = all(global_checks.values()) and all(row["status"] in
         ("OBSERVED", "OBSERVED_AGGREGATED_CALLERS", "NOT_OBSERVED_IN_COVERED_WINDOW") for row in points)
-    report = {"schema": "uc.entry-evidence-acceptance.v1", "accepted": accepted,
+    report = {"schema": "uc.entry-evidence-acceptance.v2", "accepted": accepted,
         "game_runtime_verified": accepted and bool(bindings)
             and all(binding.get("module") in ("game", "unity") for binding in bindings),
         "run": {"path": str(run), "unit_path": str(unit_run),
@@ -310,4 +392,12 @@ if __name__ == "__main__":
     parser.add_argument("--ledger", type=Path)
     parser.add_argument("--unit")
     args = parser.parse_args()
-    print(json.dumps(run_main(analyze_run, args.run, args.out, args.ledger, args.unit), ensure_ascii=False))
+    value = run_main(analyze_run, args.run, args.out, args.ledger, args.unit)
+    print(json.dumps({"schema": "uc.entry-evidence-acceptance-cli.v1",
+                      "artifact": str((args.out.resolve() / "entry-acceptance.json")),
+                      "accepted": value.get("accepted"),
+                      "game_runtime_verified": value.get("game_runtime_verified"),
+                      "generation": value.get("generation"),
+                      "summary": value.get("summary", {}),
+                      "runtime_execution_edges": len(value.get("runtime_execution_edges", []))},
+                     ensure_ascii=False))

@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import copy
 import json
 from pathlib import Path
 
@@ -22,6 +23,54 @@ def validate_qualification_scope(requested: dict, observed: dict, expected_ids: 
             raise ValueError("qualification result does not cover every source plan entry")
     elif set(observed) != expected_ids:
         raise ValueError("qualification result does not exactly cover source plan entries")
+
+
+def qualified_evidence_refs(existing: list[str], module_alias: str) -> list[str]:
+    """Append process qualification without erasing source-plan authority."""
+    return list(dict.fromkeys([*existing, module_alias + "-module", "target-qualification"]))
+
+
+def qualified_source_table(source_plan: dict, module_sources: dict,
+                           evidence_path: Path) -> dict:
+    """Carry every immutable v1 authority into the process-bound v2 plan."""
+    result = copy.deepcopy(source_plan.get("sources", {}))
+    result["target-qualification"] = {
+        "path": str(evidence_path), "sha256": file_hash(evidence_path)
+    }
+    for alias in sorted({point["module"] for point in source_plan["points"]}):
+        wanted = {"path": module_sources[alias]["path"],
+                  "sha256": module_sources[alias]["sha256"]}
+        existing = result.get(alias + "-module")
+        if existing is not None and existing != wanted:
+            raise ValueError(f"{alias}: source plan module authority differs from manifest")
+        result[alias + "-module"] = wanted
+    return result
+
+
+def derive_entry_qualified_manifest(manifest: dict, evidence_path: Path,
+                                    process_identity: dict) -> dict:
+    """Promote only the entry side after an in-process patch/restore check.
+
+    A mechanical exit manifest is sufficient to bind function identities for
+    an entry-only plan, but the native runtime deliberately refuses a purely
+    mechanical manifest.  Target qualification supplies real evidence for the
+    entry sites only; it must not promote exit completeness or terminal
+    semantics.
+    """
+    derived = copy.deepcopy(manifest)
+    if derived["status"] == "mechanical-candidate":
+        derived["status"] = "partially-verified"
+    derived["qualification_scope"] = "entry-only"
+    derived["entry_activation_ready"] = True
+    derived["exit_activation_ready"] = False
+    derived["target_process_identity"] = process_identity
+    derived["target_qualification_evidence"] = {
+        "path": str(evidence_path), "sha256": file_hash(evidence_path)
+    }
+    # Preserve every mechanical exit claim exactly as it was.  In particular,
+    # no completeness bit, terminal verification bit, or exit patch contract
+    # is upgraded here.
+    return derived
 
 
 def run(manifest_path: Path, plan_path: Path, evidence_path: Path, output: Path,
@@ -57,14 +106,15 @@ def run(manifest_path: Path, plan_path: Path, evidence_path: Path, output: Path,
         process_identities.append(patch["target_process_identity"])
     if any(identity != process_identities[0] for identity in process_identities[1:]):
         raise ValueError("qualified entry sites belong to different process instances")
+    process_identity = process_identities[0]
     functions = {row["function_id"]: row for row in manifest["functions"]}
     module_sources = {row["alias"]: row for row in manifest["sources"] if row.get("kind") == "module"}
-    source_table = {
-        "target-qualification": {"path": str(evidence_path), "sha256": file_hash(evidence_path)}
-    }
-    for alias in sorted({point["module"] for point in source_plan["points"]}):
-        source_table[alias + "-module"] = {"path": module_sources[alias]["path"],
-                                           "sha256": module_sources[alias]["sha256"]}
+    source_table = qualified_source_table(source_plan, module_sources, evidence_path)
+    output.mkdir(parents=True)
+    entry_manifest = derive_entry_qualified_manifest(manifest, evidence_path, process_identity)
+    validate_exit_manifest(entry_manifest)
+    entry_manifest_path = output / "native-entry-manifest.target-qualified.json"
+    entry_manifest_path.write_bytes(canonical(entry_manifest))
     observations = []
     for point in source_plan["points"]:
         function = functions[point["id"]]
@@ -74,7 +124,8 @@ def run(manifest_path: Path, plan_path: Path, evidence_path: Path, output: Path,
             if read.get("phase") != "enter":
                 raise ValueError(f"{point['id']}: entry-only plan cannot preserve leave reads")
             read_copy = dict(read)
-            read_copy["evidence"] = [point["module"] + "-module", "target-qualification"]
+            read_copy["evidence"] = qualified_evidence_refs(
+                list(read.get("evidence", [])), point["module"])
             reads.append(read_copy)
         observation={"id": point["id"] + "/entry", "backend": "gum_function_probe_pair",
             "module": point["module"],
@@ -84,14 +135,17 @@ def run(manifest_path: Path, plan_path: Path, evidence_path: Path, output: Path,
             # but activating exits additionally requires the derived manifest
             # to carry fully qualified exit candidates (compile enforces it).
             "exit_capture_requirement": exit_requirement,
-            "native_exit_manifest": {"path": str(manifest_path), "sha256": file_hash(manifest_path),
+            "native_exit_manifest": {"path": str(entry_manifest_path),
+                                     "sha256": file_hash(entry_manifest_path),
                                      "function_id": point["id"]},
-            "evidence": [point["module"] + "-module", "target-qualification"]}
+            "evidence": qualified_evidence_refs(list(point.get("evidence", [])), point["module"])}
+        if "field_read_contract" in point:
+            observation["field_read_contract"] = copy.deepcopy(point["field_read_contract"])
         if "retention" in point:
             observation["retention"] = dict(point["retention"])
         observations.append(observation)
     plan = {"schema": "uc.capture-plan.v2", "plan_id": "target-qualified-" + source_plan["plan_id"],
-        "plan_revision": source_plan["plan_revision"], "process_binding": process_identities[0],
+        "plan_revision": source_plan["plan_revision"], "process_binding": process_identity,
         "modules": {alias: source_plan["modules"][alias]
                     for alias in sorted({point["module"] for point in source_plan["points"]})},
         "sources": source_table,
@@ -102,7 +156,6 @@ def run(manifest_path: Path, plan_path: Path, evidence_path: Path, output: Path,
                                  "partial_overlap": "reject"},
         "observations": observations}
     compiled = compile_probe_pair(plan, verify_sources=True)
-    output.mkdir(parents=True)
     plan_out = output / "entry-plan.target-qualified.json"
     plan_out.write_bytes(canonical(plan))
     report = {"schema": "uc.entry-qualification-application.v1", "process_bound": True,
@@ -110,6 +163,8 @@ def run(manifest_path: Path, plan_path: Path, evidence_path: Path, output: Path,
         "exit_requirement_requested": exit_requirement,
         "source_plan": {"path": str(plan_path), "sha256": file_hash(plan_path)},
         "qualification_evidence": {"path": str(evidence_path), "sha256": file_hash(evidence_path)},
+        "entry_manifest": {"path": str(entry_manifest_path), "sha256": file_hash(entry_manifest_path),
+                           "qualification_scope": "entry-only", "exit_activation_ready": False},
         "entry_plan": {"path": str(plan_out), "sha256": file_hash(plan_out), "plan_hash": compiled.plan_hash},
         "logical_observations": len(observations), "physical_sites": len(compiled.sites),
         "qualification_sites_total": len(observed), "qualification_sites_used": len(expected_ids),

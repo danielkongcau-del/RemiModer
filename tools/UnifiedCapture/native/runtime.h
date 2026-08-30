@@ -38,12 +38,12 @@ class Runtime {
     std::atomic<uint64_t> unattributedStorageLoss{0};
     mutable std::mutex stateMutex,metaMutex,errorMutex;
     std::vector<std::shared_ptr<Generation>> generations;
-    Json archivedLoss=Json::array(),archivedRetention=Json::array();
+    Json archivedLoss=Json::array(),archivedRetention=Json::array(),archivedMetrics=Json::array();
     std::vector<std::unique_ptr<Hook>> hooks;
     std::deque<Json> metadata;
     std::unique_ptr<Store> store;
     GumInterceptor* interceptor=nullptr;
-    uint64_t generationCounter=0,flushQpc=0,stopQpc=0;
+    uint64_t generationCounter=0,flushQpc=0,stopQpc=0,markCounter=0;
     std::string storageError;fs::path outputRoot;
     std::string observerSha,observerPath;
     bool clean=false,forcedTerminal=false,moduleInvalid=false,closeInitiated=false,closeForced=false;uint64_t lastModuleCheck=0;
@@ -56,6 +56,7 @@ class Runtime {
     void ReportLoss(const Generation&,Point&,uint64_t);
     void ReportRetention(const Generation&,Point&,uint64_t);
     static Json PointSnapshot(const Generation&,const Point&);
+    static Json PointMetricsSnapshot(const Generation&,const Point&,uint64_t);
     static Json RetentionSnapshot(const Generation&,const Point&);
     void NoteAdmissionDrop() noexcept;
     void ReportAdmissionWindow();
@@ -75,7 +76,7 @@ public:
     // Drain the in-memory metadata queue into the durable manifest; control
     // paths call this before acknowledging state transitions.
     void FlushMetaDurable();
-    void Mark(const std::string&);
+    Json Mark(const std::string&);
     void Stop(bool force=false);
     void Start();
     Json RebindPlan()const;

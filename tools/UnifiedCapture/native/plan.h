@@ -4,9 +4,11 @@
 namespace uc {
 enum class Backend { Slot, GumProbe };
 enum class PointMode { Single, ProbePair };
-enum class RetentionMode { Full, FirstPerEntryReturnAddress };
+enum class RetentionMode { Full, FirstPerEntryReturnAddress, FirstPerCompositeKey };
+enum class RetentionKeyKind { EntryReturnAddress, Register };
+constexpr uint32_t MaxRetentionKeyParts = 4;
 enum class Base { Register, EntryRegister, Argument, Previous, Module };
-enum class Op { Scalar, Relative, Block, Array, CString };
+enum class Op { Scalar, Relative, Register, Block, Array, CString };
 // Hard ceiling on combined per-point pool preallocation. A bad plan must fail
 // validation, not allocate gigabytes inside the observed process.
 constexpr uint64_t MaxPlanPreallocationBytes = 256ull << 20;
@@ -24,9 +26,10 @@ struct ReadOp {
     uint32_t index=0,phase=3;uint64_t moduleBase=0,offset=0,size=8,stride=0,maxCount=0;
     uint32_t countIndex=0;
     // Entry-phase predicate: the event is filtered (not recorded, counted
-    // separately from loss) unless the loaded scalar matches. Evaluated on the
-    // raw loaded bits before any relative adjustment.
-    bool hasPredicate=false,predicateNegate=false;uint64_t predicateValue=0,predicateMask=~0ull;
+    // separately from loss) unless the loaded scalar or copied register bits
+    // match. Evaluated on the raw bits before any relative adjustment.
+    bool hasPredicate=false,predicateNegate=false;uint32_t predicateCount=0;
+    std::array<uint64_t,16> predicateValues{};uint64_t predicateMask=~0ull;
 };
 struct ReadResult {
     uint64_t address=0,value=0,count=0;uint32_t begin=0,bytes=0,status=0;
@@ -37,24 +40,43 @@ struct Record {
     bool parentKnown=false,exceptional=false;
     Abi abi;std::vector<ReadResult> reads;Bytes bytes;size_t used=0;
     uint32_t legacyOffset=0,legacySize=0,legacyFailures=0;bool legacyTruncated=false;
-    uint32_t exitHookId=UINT32_MAX;uint64_t retentionKey=0;
+    uint32_t exitHookId=UINT32_MAX,retentionSlotIndex=UINT32_MAX,retentionKeyPartCount=0;
+    uint64_t retentionKeyHash=0,retentionEntryReturnAddress=0;
+    std::array<uint64_t,MaxRetentionKeyParts> retentionKeyParts{};bool retentionExact=false;
+};
+struct RetentionKeyPart {
+    RetentionKeyKind kind=RetentionKeyKind::EntryReturnAddress;uint32_t registerIndex=0;uint64_t mask=~0ull;
 };
 struct AggregateSlot {
-    // key==0 is the empty marker. Entry return addresses are required to be
-    // non-zero before they may enter this table.
-    std::atomic<uint64_t> key{0},count{0},first{UINT64_MAX},last{0},fullRecords{0};
+    // fingerprint==0 is empty. The winning callback publishes immutable raw
+    // key parts before ready=1. A concurrent callback never waits for an
+    // interrupted initializer; it records retention_key_busy instead.
+    std::atomic<uint64_t> fingerprint{0};
+    std::array<std::atomic<uint64_t>,MaxRetentionKeyParts> parts{};
+    std::atomic<uint32_t> ready{0},partCount{0};
+    std::atomic<uint64_t> count{0},first{UINT64_MAX},last{0},fullRecords{0},persistedRecords{0};
     std::atomic<uint32_t> sampleState{0}; // 0=missing, 1=callback owns attempt, 2=queued
 };
-struct RetentionResult {bool retain=true;AggregateSlot* slot=nullptr;uint64_t key=0;};
+struct RetentionResult {
+    bool retain=true;AggregateSlot* slot=nullptr;uint64_t hash=0,entryReturnAddress=0;bool exact=false;
+    uint32_t partCount=0;std::array<uint64_t,MaxRetentionKeyParts> parts{};
+};
 struct ExitSite {
-    std::string id;uint64_t address=0;Bytes prefix;Json contract;uint32_t hookId=UINT32_MAX,requiredRedirectSpan=0;void* runtimeHook=nullptr;
+    std::string id,moduleAlias,completionSemantics;uint64_t address=0,callerReturnAddress=0;Bytes prefix;Json contract;
+    uint32_t hookId=UINT32_MAX,requiredRedirectSpan=0;void* runtimeHook=nullptr;
 };
 struct Cell {
     std::atomic<unsigned> state{0},flags{0}; // 0=free,1=initializing,2=active
+    std::atomic<uint32_t> readyQueued{0};uint32_t readyNext=UINT32_MAX;
     Record enter,leave;
 };
-enum class LossReason { QueueOverflow, ReadFailure, Truncation, StorageFailure, FrameTerminationUnknown,
-    RetentionKeyUnavailable, RetentionCapacity, Count };
+// Capacity failures are deliberately separate.  A full record pool, a full
+// storage sealing backlog, and a full pair ledger have different remedies and
+// must never be collapsed into a generic "queue overflow" bucket.
+enum class LossReason { RecordPoolExhausted, StoreBackpressure, PairFrameCapacity,
+    ThreadNestingCapacity, PairPayloadCapacity, PairOpenFailure, ReadFailure,
+    Truncation, StorageFailure, FrameTerminationUnknown, RetentionKeyUnavailable,
+    RetentionKeyBusy, RetentionCapacity, Count };
 struct ReasonLoss {
     std::atomic<uint64_t> occurrences{0},events{0},bytes{0},unknownBytes{0},first{UINT64_MAX},last{0};
 };
@@ -63,14 +85,14 @@ struct Loss {
     std::atomic<uint64_t> first{UINT64_MAX},last{0};
     std::array<ReasonLoss,(size_t)LossReason::Count> reasons;
     void Note(uint64_t qpc,uint64_t lost,uint64_t knownBytes=0,bool unknown=false,
-              LossReason reason=LossReason::QueueOverflow,uint64_t occurrences=1);
+              LossReason reason=LossReason::RecordPoolExhausted,uint64_t occurrences=1);
     Json Snapshot(const std::string&,uint64_t)const;
 };
 struct Point {
     std::string id,moduleAlias,abi,evidenceHash;Backend backend;
     uint64_t address=0,original=0,moduleBase=0;Bytes prefix;
     std::vector<ReadOp> ops;
-    size_t blobCapacity=0;uint32_t poolSize=0,hookId=0;
+    size_t blobCapacity=0;uint32_t poolSize=0,hookId=0,numericId=0;
     PointMode mode=PointMode::Single;uint64_t logicalIdentity=0;std::string functionId,exitRequirement;
     uint32_t requiredRedirectSpan=0;
     std::vector<ExitSite> exits;
@@ -78,14 +100,30 @@ struct Point {
     // Semaphore for O(1) rejection when the pool is exhausted instead of an
     // O(poolSize) CAS scan per event. Owned by Acquire/worker release.
     std::atomic<uint32_t> freeSlots{0};
+    // Tagged intrusive ready stack. Producers publish only indices of their
+    // already-owned cells; the worker detaches complete batches in O(ready).
+    std::atomic<uint64_t> readyHead{UINT32_MAX};
+    std::atomic<uint32_t> readyDepth{0},readyHighWater{0};
+    // Independent cumulative health counters.  They are diagnostic evidence,
+    // not substitutes for event/loss records, and therefore never share the
+    // ordinary record pool.
+    std::atomic<uint64_t> callbacksObserved{0},recordsCaptured{0},recordsStoreAttempted{0},recordsEncoded{0};
+    std::atomic<uint32_t> poolHighWater{0};
     // Deliberate predicate filtering is accounted independently from loss.
     std::atomic<uint64_t> filtered{0};
     // Per-plan evidence retention. GPRs are copied at callback entry; XMM is
     // copied only when this logical point retains a full record.
     bool captureXmm=true;
-    RetentionMode retention=RetentionMode::Full;uint32_t aggregateCapacity=0;
+    RetentionMode retention=RetentionMode::Full;uint32_t aggregateCapacity=0,retentionKeyPartCount=0;
+    std::array<RetentionKeyPart,MaxRetentionKeyParts> retentionKeyParts{};
     std::unique_ptr<AggregateSlot[]> aggregates;
-    std::atomic<uint64_t> aggregateCallbacks{0},aggregateDuplicates{0},aggregateSuppressed{0};
+    // Resolved only for this module load instance. CapturePlan stores these as
+    // evidence-backed module-relative return addresses.
+    std::vector<uint64_t> exactCallerAddresses;
+    std::atomic<uint64_t> aggregateCallbacks{0},aggregateDuplicates{0},aggregateSuppressed{0},aggregateExactCallbacks{0};
+    // First QPC at which an exact per-callback stream became incomplete.
+    // This is independent from aggregate caller-count completeness.
+    std::atomic<uint64_t> exactCoverageBrokenAt{0};
     Json lastReportedRetention; // Writer thread only.
     Json lastReportedLoss; // Writer thread only, never inspected in a callback.
     uint64_t coverageBegin=0,coverageEnd=0;
@@ -93,6 +131,10 @@ struct Point {
     std::string legacyReader;unsigned readerKind=0,legacyKind=0;uint64_t legacyUnity=0,legacyVtable=0;size_t legacyBytes=0;
     std::atomic<uint64_t> readSamples{0},readTicks{0},readMax{0};
     Cell* Acquire();
+    void QueueReady(Cell*) noexcept;
+    uint32_t TakeReady() noexcept;
+    bool IsExactCaller(uint64_t callerAddress)const noexcept;
+    void BreakExactCoverage(uint64_t qpc) noexcept;
     RetentionResult Retain(const Abi&,uint64_t) noexcept;
 };
 struct Generation {

@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "uc.CaptureCheckpoint.v1",
+  "type": "object",
+  "required": [
+    "kind", "schema", "checkpoint_id", "label", "generation_counter",
+    "snapshot_begin_qpc", "snapshot_end_qpc", "snapshot_atomic",
+    "snapshot_consistency", "loss", "retention", "point_metrics", "storage",
+    "admission", "unattributed_storage_loss_events"
+  ],
+  "properties": {
+    "kind": {"const": "capture_checkpoint"},
+    "schema": {"const": "uc.CaptureCheckpoint.v1"},
+    "checkpoint_id": {"type": "integer", "minimum": 1},
+    "label": {"type": "string"},
+    "generation_counter": {"type": "integer", "minimum": 0},
+    "snapshot_begin_qpc": {"type": "integer", "minimum": 0},
+    "snapshot_end_qpc": {"type": "integer", "minimum": 0},
+    "snapshot_atomic": {"const": false},
+    "snapshot_consistency": {"const": "bounded_non_atomic_cumulative"},
+    "loss": {"type": "array"},
+    "retention": {"type": "array"},
+    "point_metrics": {"type": "array"},
+    "storage": {"type": "object"},
+    "admission": {
+      "type": "object",
+      "required": ["drops", "first_qpc", "last_qpc"],
+      "properties": {
+        "drops": {"type": "integer", "minimum": 0},
+        "first_qpc": {"type": "integer", "minimum": 0},
+        "last_qpc": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "unattributed_storage_loss_events": {"type": "integer", "minimum": 0}
+  },
+  "additionalProperties": true
+}

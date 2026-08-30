@@ -77,6 +77,7 @@ public:
         return 0;
     }
     size_t Size()const noexcept{return count;}
+    bool HasGroup(uint64_t group)const noexcept {for(size_t i=0;i<count;++i)if(frames[i].callGroup==group)return true;return false;}
     size_t GroupCount()const noexcept {size_t groups=0;uint64_t prior=0;
         for(size_t i=0;i<count;++i)if(frames[i].callGroup!=prior){prior=frames[i].callGroup;++groups;}return groups;}
 };

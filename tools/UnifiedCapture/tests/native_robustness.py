@@ -42,7 +42,10 @@ def run():
         rows = records(status["directory"])
         lost = sum(x["events"] for x in status["loss"])
         assert lost > 0 and len(rows) + lost == 2 * count, (len(rows), lost, count)
-        assert sum(x["reasons"]["queue_overflow"]["events"] for x in status["loss"]) == lost
+        assert sum(x["reasons"]["record_pool_exhausted"]["events"] for x in status["loss"]) == lost
+        assert not sum(x["reasons"]["store_backpressure"]["events"] for x in status["loss"])
+        metrics = status["point_metrics"][0]
+        assert metrics["pool_high_water"] == 1 and metrics["records_encoded"] == len(rows), metrics
         metadata, errors = read_manifest(Path(status["directory"]) / "session.manifest")
         summaries = [r for r in metadata if r["kind"] == "loss_summary"]
         assert not errors and summaries and summaries[-1]["loss"]["events"] == lost
@@ -331,11 +334,22 @@ def run():
             calls += 20
             time.sleep(.15)
         assert h.control("status")["state"] == "RUNNING"
-        h.control("mark", label="after-15-seconds-and-200-events")
+        marked = h.control("mark", label="after-15-seconds-and-200-events")
+        assert marked["checkpoint"]["checkpoint_id"] == 1
         end = h.stop()
         rows = records(end["directory"])
         assert len(rows) == 2 * calls > 200 and not sum(x["events"] for x in end["loss"])
-        return {"elapsed_seconds": time.monotonic()-start, "calls": calls, "events": len(rows), "automatic_stop": False}
+        metadata, errors = read_manifest(Path(end["directory"]) / "session.manifest")
+        checkpoints = [row for row in metadata if row.get("kind") == "capture_checkpoint"]
+        marks = [row for row in metadata if row.get("kind") == "user_mark"]
+        assert not errors and len(checkpoints) == 1 and len(marks) == 1
+        assert checkpoints[0]["checkpoint_id"] == marks[0]["checkpoint_id"] == 1
+        assert checkpoints[0]["schema"] == "uc.CaptureCheckpoint.v1"
+        assert checkpoints[0]["snapshot_begin_qpc"] <= checkpoints[0]["snapshot_end_qpc"] == marks[0]["qpc"]
+        assert checkpoints[0]["snapshot_consistency"] == "bounded_non_atomic_cumulative"
+        assert checkpoints[0]["point_metrics"][0]["callbacks_observed"] == calls
+        return {"elapsed_seconds": time.monotonic()-start, "calls": calls, "events": len(rows),
+                "automatic_stop": False, "mark_checkpoint_linked": True}
     case("no-legacy-duration-or-count-cutoff", duration)
 
     def double_stop_and_apply_after_stop(h):

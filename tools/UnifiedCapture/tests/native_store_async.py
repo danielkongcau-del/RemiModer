@@ -26,6 +26,14 @@ def main():
     status = result["status"]
     if status["sealed_chunks"] != 3 or status["outstanding_seal_bytes"] != 0:
         raise AssertionError(status)
+    if status["events_attempted"] != 5 or status["events_encoded"] != 5 or \
+            status["encoded_record_bytes"] <= 15 * 1024 * 1024 or \
+            status["buffered_bytes_high_water"] < 3 * 1024 * 1024 or \
+            status["outstanding_seal_bytes_high_water"] == 0 or \
+            status["manifest_flushes"] == 0 or status["target_segment_bytes"] != 32 * 1024 * 1024 or \
+            status["max_outstanding_seal_bytes"] != 256 * 1024 * 1024 or \
+            status["compressed_chunks"] + status["raw_chunks"] != 3:
+        raise AssertionError(status)
     report = {"ok": True, "chunks": chunk_ids, "events": 5,
               "unique_enqueue_time_ids": True, "bounded_outstanding_bytes": True}
     path = root / "report.json"
