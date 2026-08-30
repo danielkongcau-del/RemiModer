@@ -52,7 +52,7 @@ class Runtime {
     void Detach(Hook&);
     Bytes OriginalPrefix(uint64_t,size_t)const;
     Bytes ExpectedPrefix(const Hook&)const;
-    void WriteRecord(const Generation&,Point&,const Record&,const char*);
+    bool WriteRecord(const Generation&,Point&,const Record&,const char*);
     void ReportLoss(const Generation&,Point&,uint64_t);
     void ReportRetention(const Generation&,Point&,uint64_t);
     static Json PointSnapshot(const Generation&,const Point&);

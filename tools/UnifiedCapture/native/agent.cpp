@@ -32,11 +32,11 @@ struct PipeSecurity {
         auto* user=(TOKEN_USER*)buffer.data();LPWSTR rawSid=nullptr;
         uc::Require(ConvertSidToStringSidW(user->User.Sid,&rawSid)!=FALSE,"control pipe SID conversion failed");
         struct LocalCloser {HLOCAL value;~LocalCloser(){if(value)LocalFree(value);}} sid{rawSid};
-        // DACL: only this process user and SYSTEM.  Low mandatory label makes
-        // the duplex pipe reachable by the same user's medium-integrity local
-        // controller even when XXMI launched the game elevated.  Remote pipe
-        // clients remain rejected by PIPE_REJECT_REMOTE_CLIENTS below.
-        std::wstring sddl=L"D:P(A;;GA;;;SY)(A;;GA;;;"+std::wstring(rawSid)+L")S:(ML;;NW;;;LW)";
+        // DACL: only this process user and SYSTEM. A medium mandatory label is
+        // sufficient for the normal medium controller -> elevated observer
+        // path while denying writes from same-user low-integrity processes.
+        // Remote clients remain rejected by PIPE_REJECT_REMOTE_CLIENTS below.
+        std::wstring sddl=L"D:P(A;;GA;;;SY)(A;;GA;;;"+std::wstring(rawSid)+L")S:(ML;;NW;;;ME)";
         uc::Require(ConvertStringSecurityDescriptorToSecurityDescriptorW(sddl.c_str(),SDDL_REVISION_1,
             &descriptor,nullptr)!=FALSE,"control pipe security descriptor creation failed");
         attributes.nLength=sizeof(attributes);attributes.lpSecurityDescriptor=descriptor;
@@ -86,7 +86,8 @@ uc::Json Handle(const uc::Json& request){
     else if(command=="mark"){result={{"ok",true},{"accepted",true},{"checkpoint",runtime->Mark(request.at("label"))}};}
     else throw std::runtime_error("unknown command");
     result["request_id"]=id;
-    if(command=="start"||command=="stop"||command=="mark")result["generation"]=runtime->Status().at("generation");
+    if(command=="mark")result["generation"]=result.at("checkpoint").at("generation");
+    else if(command=="start"||command=="stop")result["generation"]=runtime->Status().at("generation");
     if(mutation)completed.at(id).second=result;return result;
     }catch(const std::exception& e){if(!mutation)throw;Json failure={{"ok",false},{"request_id",id},
             // The control boundary cannot assume every backend exception was

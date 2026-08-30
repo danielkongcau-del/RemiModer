@@ -363,17 +363,25 @@ RetentionResult Point::Retain(const Abi& rawAbi,uint64_t qpc) noexcept {
     uint64_t hash=0x9e3779b97f4a7c15ULL;
     for(uint32_t i=0;i<result.partCount;++i){uint64_t value=result.parts[i]+0x9e3779b97f4a7c15ULL+(hash<<6)+(hash>>2);
         value^=value>>33;value*=0xff51afd7ed558ccdULL;value^=value>>33;hash^=value;}
-    if(!hash)hash=0xd6e8feb86659fd93ULL;result.hash=hash;
+    constexpr uint64_t Publishing=1;
+    if(hash<=Publishing)hash=0xd6e8feb86659fd93ULL;result.hash=hash;
+    const uint32_t loadLimit=std::max<uint32_t>(1,(aggregateCapacity*3+3)/4);
+    for(uint32_t retry=0;;++retry){bool restart=false;
     for(uint32_t probe=0;probe<aggregateCapacity;++probe){auto& slot=aggregates[(hash+probe)&(aggregateCapacity-1)];
         uint64_t observed=slot.fingerprint.load(std::memory_order_acquire);bool first=false;
-        if(!observed){uint64_t empty=0;if(slot.fingerprint.compare_exchange_strong(empty,hash,std::memory_order_acq_rel)){
+        if(observed==Publishing){restart=true;break;}
+        if(!observed){
+            if(aggregateKeys.load(std::memory_order_relaxed)>=loadLimit){
+                BreakExactCoverage(qpc);loss.Note(qpc,1,0,true,LossReason::RetentionCapacity);return result;}
+            uint64_t empty=0;if(slot.fingerprint.compare_exchange_strong(empty,Publishing,std::memory_order_acq_rel)){
                 first=true;slot.partCount.store(result.partCount,std::memory_order_relaxed);
                 for(uint32_t i=0;i<result.partCount;++i)slot.parts[i].store(result.parts[i],std::memory_order_relaxed);
-                slot.ready.store(1,std::memory_order_release);}
-            else observed=empty;}
+                slot.ready.store(1,std::memory_order_relaxed);slot.fingerprint.store(hash,std::memory_order_release);
+                aggregateKeys.fetch_add(1,std::memory_order_relaxed);observed=hash;}
+            else {observed=empty;if(observed==Publishing){restart=true;break;}}}
         if(first||observed==hash){
-            if(!first&&!slot.ready.load(std::memory_order_acquire)){
-                BreakExactCoverage(qpc);loss.Note(qpc,1,0,true,LossReason::RetentionKeyBusy);return result;}
+            // Observing the real fingerprint with acquire also observes every
+            // immutable key part published before it; ready is diagnostic only.
             bool same=slot.partCount.load(std::memory_order_relaxed)==result.partCount;
             for(uint32_t i=0;i<result.partCount&&same;++i)same=slot.parts[i].load(std::memory_order_relaxed)==result.parts[i];
             if(!same)continue;
@@ -386,7 +394,13 @@ RetentionResult Point::Retain(const Abi& rawAbi,uint64_t qpc) noexcept {
             uint32_t missing=0;const bool claim=slot.sampleState.compare_exchange_strong(missing,1,std::memory_order_acq_rel);
             if(!claim)aggregateSuppressed.fetch_add(1,std::memory_order_relaxed);
             result.retain=claim;return result;}}
-    BreakExactCoverage(qpc);loss.Note(qpc,1,0,true,LossReason::RetentionCapacity);return result;}
+        if(!restart){BreakExactCoverage(qpc);loss.Note(qpc,1,0,true,LossReason::RetentionCapacity);return result;}
+        // An initializer performs only fixed atomic stores. Briefly retry the
+        // probe sequence so its normal publication window is not evidence
+        // loss; a genuinely stalled publisher remains a bounded, explicit gap.
+        if(retry>=1023){BreakExactCoverage(qpc);loss.Note(qpc,1,0,true,LossReason::RetentionKeyBusy);return result;}
+        YieldProcessor();
+    }}
 std::shared_ptr<Generation> Compile(const Json& source,const std::function<uint64_t(uint64_t)>& slotResolver){
     std::function<void(const Json&)> numbers=[&](const Json& value){Require(!value.is_number_float(),"CapturePlan uses integer bit patterns, not floating JSON numbers");
         if(value.is_structured())for(const auto& child:value)numbers(child);};numbers(source);

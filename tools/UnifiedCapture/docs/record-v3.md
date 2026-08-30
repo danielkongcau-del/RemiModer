@@ -32,3 +32,10 @@ The Python decoder remains backward-compatible with `UCEVT002` and projects
 both versions to `uc.event.v1` JSON. For composite keys the projection includes
 `kind=composite`, the fingerprint, entry return address, all raw parts, and the
 retention lane.
+
+For an exact-promoted probe pair, the leave record inherits the entry's full
+retention identity and slot index. Runtime summaries distinguish
+`exact_entries_persisted`, `exact_normal_exits_persisted`, and
+`exact_pairs_persisted`; pair-stream completeness is based on persisted pairs,
+not on the entry count alone. A persistence failure on either half breaks the
+exact stream at the first known failure QPC.

@@ -104,15 +104,19 @@ def _binary_event(metadata: bytes, dictionaries):
         raise ValueError("unsupported binary event metadata")
     if format_version == 3:
         (event_id, generation, qpc, read_end_qpc, invocation, parent, retention_hash,
-         _stack_marker, retention_entry_return) = values[5:14]
+         stack_marker, retention_entry_return) = values[5:14]
         (flags, register_mask, xmm_mask, argument_mask, exit_hook_id, legacy_offset,
          legacy_size, legacy_failures, read_count, retention_part_count) = values[14:24]
     else:
-        (event_id, generation, qpc, read_end_qpc, invocation, parent, retention_hash,
-         _stack_marker) = values[5:13]
+        (event_id, generation, qpc, read_end_qpc, invocation, parent, legacy_retention_key,
+         stack_marker) = values[5:13]
         (flags, register_mask, xmm_mask, argument_mask, exit_hook_id, legacy_offset,
          legacy_size, legacy_failures, read_count) = values[13:22]
-        retention_entry_return = retention_hash
+        # UCEVT002 predates composite hashing: this field is the raw, single
+        # entry-return-address key despite the v3-oriented local naming used by
+        # older decoder revisions.
+        retention_hash = legacy_retention_key
+        retention_entry_return = legacy_retention_key
         retention_part_count = 1 if flags & 32 else 0
     dictionary = (dictionaries or {}).get((generation, point_numeric_id))
     if dictionary is None:
@@ -163,7 +167,7 @@ def _binary_event(metadata: bytes, dictionaries):
         "tid": tid, "observed_parent": parent, "parent_known": bool(flags & 1),
         "snapshot_atomic": False, "exceptional": bool(flags & 2), "reads": reads,
         "read_failures": failures, "truncated": truncated,
-        "raw_abi": {"registers": registers, "xmm": xmm,
+        "raw_abi": {"registers": registers, "xmm": xmm, "stack_marker": stack_marker,
                     "register_mask": register_mask, "xmm_mask": xmm_mask},
         "semantic_interpretation": {
             "version": "uc.legacy-abi.v1" if dictionary["backend"] == "slot" else "uc.raw-only.v1",

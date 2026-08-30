@@ -35,6 +35,7 @@ def run(inventory_path: Path, output: Path) -> dict[str, Any]:
                             "evidence": []})
         if callers:
             points.append({"point": row["source_plan_point"],
+                           "source_observation_point": row["point"],
                            "callers": sorted(callers, key=lambda item: (item["module"], item["return_rva"]))})
     if not points:
         raise ValueError("inventory contains no exact-promotion-eligible caller")

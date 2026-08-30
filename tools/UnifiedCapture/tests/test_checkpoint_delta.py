@@ -1,4 +1,9 @@
 import unittest
+from pathlib import Path
+import sys
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 from checkpoint_delta import build_deltas
 
@@ -52,6 +57,18 @@ class CheckpointDeltaTests(unittest.TestCase):
         point = build_deltas([first, second], manifest_complete=True)[0]["points"][0]
         self.assertFalse(point["baseline_checkpoint_contains_generation"])
         self.assertEqual(point["integrity"], "UNKNOWN_GENERATION_BASELINE_ABSENT")
+
+    def test_invalid_or_backwards_qpc_intervals_are_rejected(self):
+        for mutate in (
+            lambda rows: rows[0].update(snapshot_end_qpc=99),
+            lambda rows: rows[0].update(snapshot_begin_qpc=-1),
+            lambda rows: rows[1].update(snapshot_begin_qpc=102),
+            lambda rows: rows[1].update(snapshot_begin_qpc="200"),
+        ):
+            rows = [checkpoint(1, 10), checkpoint(2, 20)]
+            mutate(rows)
+            with self.subTest(rows=rows), self.assertRaisesRegex(ValueError, "QPC"):
+                build_deltas(rows, manifest_complete=True)
 
 
 if __name__ == "__main__":

@@ -282,6 +282,16 @@ class ProbePairPlanTests(unittest.TestCase):
             with self.subTest(message=message), self.assertRaisesRegex(ValueError, message):
                 compile_probe_pair(value)
 
+    def test_capture_xmm_must_be_boolean(self):
+        for invalid in (0, 1, "true", [], {}):
+            value = self.make_plan()
+            value["resources"]["capture_xmm"] = invalid
+            with self.subTest(value=invalid), self.assertRaisesRegex(ValueError, "expected boolean"):
+                compile_probe_pair(value)
+        value = self.make_plan()
+        value["resources"]["capture_xmm"] = False
+        self.assertEqual(len(compile_probe_pair(value).sites), 2)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -22,6 +22,23 @@ def save_new(path: Path, value: Any) -> None:
         stream.write(canonical(value))
 
 
+def coverage_contains_window(rows: list[dict[str, Any]], point: str,
+                             window: list[int] | None) -> bool:
+    """Require one complete interval to contain the whole marked window.
+
+    Merely having a complete coverage record for a point is insufficient: it
+    may describe an earlier activation interval that does not overlap the
+    user's marks at all.
+    """
+    if window is None:
+        return False
+    return any(
+        row.get("point") == point and row.get("complete") is True
+        and type(row.get("begin_qpc")) is int and type(row.get("end_qpc")) is int
+        and row["begin_qpc"] <= window[0] and row["end_qpc"] >= window[1]
+        for row in rows)
+
+
 def _load_finish(run: Path) -> dict[str, Any]:
     def order(path: Path):
         token = path.stem[len("finish-attempt-"):].split("-", 1)[0]
@@ -287,7 +304,8 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None,
     for observation in plan["observations"]:
         point = observation["id"]
         state = point_states[point]
-        covered = any(row.get("point") == point and row.get("complete") is True for row in coverage)
+        point_coverage = [row for row in coverage if row.get("point") == point]
+        covered = coverage_contains_window(point_coverage, point, window)
         losses = [row for row in loss_rows if row.get("point") == point and row.get("generation") == generation]
         lossless = len(losses) == 1 and all(losses[0].get(key) == 0 for key in
             ("events", "bytes", "unknown_byte_records", "read_failures", "truncated")) and all(
@@ -317,7 +335,11 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None,
         points.append({"point": point, "function_id": observation["native_exit_manifest"]["function_id"],
             "status": status, "event_count": state["window_count"],
             "event_ids": state["event_ids"], "event_ids_complete": state["window_count"] <= 64,
-            "coverage_complete": covered, "lossless": lossless, "raw_abi_complete": raw,
+            "coverage_complete": covered,
+            "coverage_contains_marked_window": covered,
+            "coverage_intervals": [{"begin_qpc": row.get("begin_qpc"), "end_qpc": row.get("end_qpc"),
+                                    "complete": row.get("complete")} for row in point_coverage],
+            "lossless": lossless, "raw_abi_complete": raw,
             "evidence_scope": "activation_generation" if retention_policy else "marked_window",
             "retention_generation": ({**retention_generation, "scope": "activation_generation",
                 "temporal_event_trace_complete": False} if retention_generation is not None else None),

@@ -2,8 +2,12 @@ from __future__ import annotations
 
 import json
 from pathlib import Path
+import sys
 
 import pytest
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
 
 from retained_exact_selection import run
 from uc.model import canonical
@@ -23,7 +27,7 @@ def test_selects_all_eligible_by_source_plan_identity(tmp_path: Path):
     source = tmp_path / "inventory.json";source.write_bytes(canonical(inventory()))
     report = run(source, tmp_path / "out")
     selected = json.loads(Path(report["selection"]["path"]).read_text())
-    assert selected["points"] == [{"point": "bridge", "callers": [
+    assert selected["points"] == [{"point": "bridge", "source_observation_point": "bridge/entry", "callers": [
         {"module": "fixture", "return_rva": 0x220, "evidence": []}]}]
     assert report["ineligible_not_selected"] == 1
     assert report["semantic_identity_inferred"] is False

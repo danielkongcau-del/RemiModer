@@ -57,6 +57,14 @@ def build_deltas(checkpoints: list[dict[str, Any]], *, manifest_complete: bool) 
     for prior, current in zip(checkpoints, checkpoints[1:]):
         if current["checkpoint_id"] <= prior["checkpoint_id"]:
             raise ValueError("checkpoint ids are not strictly increasing")
+        qpc_fields = []
+        for label, checkpoint in (("prior", prior), ("current", current)):
+            begin, end = checkpoint.get("snapshot_begin_qpc"), checkpoint.get("snapshot_end_qpc")
+            if type(begin) is not int or type(end) is not int or begin < 0 or end < begin:
+                raise ValueError(f"{label} checkpoint has an invalid QPC interval")
+            qpc_fields.append((begin, end))
+        if qpc_fields[1][0] < qpc_fields[0][1]:
+            raise ValueError("checkpoint QPC intervals overlap or move backwards")
         prior_metrics, current_metrics = _rows(prior, "point_metrics"), _rows(current, "point_metrics")
         prior_loss, current_loss = _rows(prior, "loss"), _rows(current, "loss")
         prior_retention, current_retention = _rows(prior, "retention"), _rows(current, "retention")

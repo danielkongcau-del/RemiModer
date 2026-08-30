@@ -14,23 +14,20 @@ sys.path.insert(0, str(ROOT / "tests"))
 from native_integration import Host, records
 from exact_caller_promotion_plan import derive
 from uc.model import canonical
-from uc.store import read_manifest
+from uc.store import inspect_session, read_manifest
+from retained_caller_inventory import run as inventory_run
+from retained_exact_selection import run as selection_run
 
 
 def retained_plans(host: Host):
     target = host.make_probe_pair_plan((("bridge/entry", "pair"),), slots=64)
-    observation = target["observations"][0]
+    discovery = copy.deepcopy(target)
+    discovery["plan_id"] = "fixture-retained-v2"
+    observation = discovery["observations"][0]
     observation["exit_capture_requirement"] = "none"
     observation["entry"]["reads"] = [row for row in observation["entry"]["reads"]
                                                if row.get("phase") != "leave"]
-    discovery = {"schema": "uc.capture-plan.v1", "plan_id": "fixture-retained-v1", "plan_revision": 1,
-        "modules": copy.deepcopy(target["modules"]), "sources": copy.deepcopy(target["sources"]),
-        "resources": {"slots_per_point": 64, "max_record_bytes": 256, "capture_xmm": True},
-        "points": [{"id": "bridge", "backend": "gum_probe", "module": observation["module"],
-            "rva": observation["entry"]["rva"], "expected_prefix": observation["entry"]["expected_prefix"],
-            "reads": copy.deepcopy(observation["entry"]["reads"]),
-            "retention": {"mode": "first_per_entry_return_address", "max_keys": 16},
-            "evidence": ["fixture"]}]}
+    observation["retention"] = {"mode": "first_per_entry_return_address", "max_keys": 16}
     target["plan_id"] += "-qualified-target"
     return discovery, target
 
@@ -58,12 +55,26 @@ def main():
         if return_address < module_base:
             raise AssertionError((return_address, module_base))
 
-        selection_path = root / "selection.json"
-        selection_path.write_bytes(canonical({"schema": "uc.exact-caller-selection.v1", "points": [{
-            "point": "bridge", "callers": [{"module": "fixture",
-                "return_rva": return_address - module_base, "evidence": ["fixture"]}]}]}))
-        # Exercise the real retained-v1 -> qualified-v2 naming/schema boundary.
-        # Promotion must join by exact module/RVA identity, not guess names.
+        # Exercise the production v2 acceptance -> inventory -> selection ->
+        # promotion identity chain. The portable point id is bridge while the
+        # activated/manifest observation id is bridge/entry.
+        acceptance_path = root / "entry-acceptance.json"
+        acceptance_path.write_bytes(canonical({
+            "schema": "uc.entry-evidence-acceptance.v2",
+            "session": {"inspection": inspect_session(discovered["directory"])},
+            "points": [{"point": "bridge/entry", "retention_generation": summary,
+                "runtime_caller_evidence": [{"return_address": return_address,
+                    "module": "fixture", "return_rva": return_address - module_base,
+                    "module_membership": "INSIDE_BOUND_MODULE",
+                    "callsite_status": "OBSERVED_RETURN_ADDRESS_RESOLVES_TO_CALL"}]}],
+        }))
+        inventory = inventory_run(acceptance_path, root / "inventory")
+        selection_report = selection_run(Path(root / "inventory" / "retained-caller-inventory.json"),
+                                         root / "selection")
+        selection_path = Path(selection_report["selection"]["path"])
+        selected = json.loads(selection_path.read_text(encoding="utf-8"))
+        if selected["points"][0].get("source_observation_point") != "bridge/entry":
+            raise AssertionError(selected)
         target_path = root / "target-plan.json"
         target_path.write_bytes(canonical(target))
         derived_root = root / "derived"
@@ -78,9 +89,10 @@ def main():
         events = [event for event, _ in records(stopped["directory"])]
         if promoted["exact_promoted_callbacks"] != 20 or \
                 promoted["exact_promoted_records_persisted"] != 20 or \
+                promoted["exact_pairs_persisted"] != 20 or \
                 not promoted["classified_exact_records_complete_so_far"]:
             raise AssertionError(promoted)
-        if len(events) != 20 or any(event.get("retention_key", {}).get("lane") != "exact_promoted"
+        if len(events) != 40 or any(event.get("retention_key", {}).get("lane") != "exact_promoted"
                                     for event in events):
             raise AssertionError(events)
         report = {"ok": True, "discovery_callbacks": 5, "exact_callbacks": 20,

@@ -357,6 +357,8 @@ def compile_probe_pair(plan: dict, *, verify_sources: bool = True) -> CompiledPr
             raise ValueError(f"source changed: {source['path']}")
     continuation_rows = _verify_caller_continuations(plan, modules, sources)
     resources = plan.get("resources", {})
+    if "capture_xmm" in resources and type(resources["capture_xmm"]) is not bool:
+        raise ValueError("capture_xmm: expected boolean")
     max_bytes = uint(resources.get("max_record_bytes"), "max_record_bytes", (1 << 32) - 1)
     if not max_bytes:
         raise ValueError("max_record_bytes: zero not supported")

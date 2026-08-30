@@ -8,6 +8,9 @@ static State fixtureState;
 static State fixtureAlternate;
 static HANDLE releaseEvent=nullptr,enteredEvent=nullptr;
 static std::vector<std::thread> blocked;
+static std::vector<std::thread> producers;
+static std::atomic<bool> producerStop{false};
+static std::atomic<uint64_t> producerCalls{0};
 static HMODULE dependency=nullptr;
 extern "C" uint64_t PairRuntimeTarget(uint64_t*,uint64_t);
 extern "C" uint64_t PairRuntimeRecursive(uint64_t*,uint32_t);
@@ -98,6 +101,17 @@ int wmain(int argc,wchar_t** argv){
         else if(op=="stress"){unsigned count=cmd.value("count",5000U),threads=cmd.value("threads",4U);std::vector<std::thread> workers;
             for(unsigned i=0;i<threads;++i)workers.emplace_back([=](){State local;for(unsigned k=0;k<count;++k)mutate(&local,(void*)1);});
             for(auto& worker:workers)worker.join();result={{"calls",count*threads}};}
+        else if(op=="stress_gum"){unsigned count=cmd.value("count",5000U),threads=cmd.value("threads",4U);std::vector<std::thread> workers;
+            std::atomic<unsigned> ready{0};for(unsigned i=0;i<threads;++i)workers.emplace_back([&,count](){State local;ready.fetch_add(1);
+                while(ready.load()<threads)YieldProcessor();for(unsigned k=0;k<count;++k)FixtureGum(&local,1);});
+            for(auto& worker:workers)worker.join();result={{"calls",count*threads}};}
+        else if(op=="start_gum_stress"){if(!producers.empty())throw std::runtime_error("producer already running");
+            unsigned threads=cmd.value("threads",2U);producerStop.store(false);producerCalls.store(0);
+            for(unsigned i=0;i<threads;++i)producers.emplace_back([](){State local;uint32_t batch=0;while(!producerStop.load()){
+                FixtureGum(&local,1);producerCalls.fetch_add(1,std::memory_order_relaxed);if(++batch==64){batch=0;Sleep(1);}}});
+            result={{"started",true},{"threads",threads}};}
+        else if(op=="stop_gum_stress"){producerStop.store(true);for(auto& worker:producers)if(worker.joinable())worker.join();producers.clear();
+            result={{"stopped",true},{"calls",producerCalls.load()}};}
         else if(op=="raise")result={{"caught",TryRaise()}};
         else if(op=="gum_raise")result={{"caught",TryGumRaise()}};
         else if(op=="block"){ResetEvent(releaseEvent);ResetEvent(enteredEvent);blocked.emplace_back([](){FixtureBlock(&fixtureState);});
@@ -108,7 +122,8 @@ int wmain(int argc,wchar_t** argv){
             auto dependencyPath=uc::fs::path(argv[1]).parent_path()/L"FixtureModule.dll";dependency=LoadLibraryW(dependencyPath.c_str());
             if(!dependency)throw std::runtime_error("fixture dependency load failed");result={{"base",(uint64_t)dependency}};}
         else if(op=="unload_dependency"){if(dependency){FreeLibrary(dependency);dependency=nullptr;}result={{"unloaded",true}};}
-        else if(op=="quit"){SetEvent(releaseEvent);for(auto& worker:blocked)if(worker.joinable())worker.join();blocked.clear();std::cout<<"{\"quit\":true}"<<std::endl;break;}
+        else if(op=="quit"){SetEvent(releaseEvent);for(auto& worker:blocked)if(worker.joinable())worker.join();blocked.clear();
+            producerStop.store(true);for(auto& worker:producers)if(worker.joinable())worker.join();producers.clear();std::cout<<"{\"quit\":true}"<<std::endl;break;}
         else throw std::runtime_error("unknown fixture operation");std::cout<<result.dump()<<std::endl;
     }catch(const std::exception& e){std::cout<<Json({{"error",e.what()}}).dump()<<std::endl;}}
     return 0;

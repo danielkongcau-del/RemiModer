@@ -64,8 +64,20 @@ def main():
             raise AssertionError(kinds)
         if retained["callbacks"] != 11 or retained["exact_promoted_callbacks"] != 10 or \
                 retained["exact_promoted_records_persisted"] != 10 or \
+                retained["exact_entries_persisted"] != 10 or \
+                retained["exact_normal_exits_persisted"] != 10 or \
+                retained["exact_pairs_persisted"] != 10 or \
                 not retained["classified_exact_records_complete_so_far"]:
             raise AssertionError(retained)
+        exact_events = [row for row in events if row.get("retention_key", {}).get("lane") == "exact_promoted"]
+        if len(exact_events) != 20 or any(
+                row["retention_key"].get("kind") != "entry_return_address"
+                or not isinstance(row["retention_key"].get("value"), int)
+                for row in exact_events):
+            raise AssertionError(exact_events)
+        if any(not isinstance(row.get("raw_abi", {}).get("stack_marker"), int)
+               or row["raw_abi"]["stack_marker"] == 0 for row in exact_events):
+            raise AssertionError("UCEVT003 stack markers were not preserved in the JSON projection")
         if sum(row["count"] for row in retained["keys"]) != 11 or len(retained["keys"]) != 2:
             raise AssertionError(retained)
         report = {"ok": True, "callbacks": 11, "exact_pairs": 10,

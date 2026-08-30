@@ -57,6 +57,32 @@ def _target_point(source_id: str, source_plan: dict[str, Any], source_row: dict[
     return matches[0]
 
 
+def _source_point(selection: dict[str, Any], plan: dict[str, Any],
+                  rows: dict[str, dict[str, Any]]) -> tuple[str, dict[str, Any]]:
+    """Resolve a selection row to the exact activated observation identity.
+
+    Production selections retain both the portable v1 point id and the v2
+    observation id that emitted the aggregate evidence.  Older hand-written
+    selections remain readable only when the name mapping is unambiguous.
+    """
+    portable = selection.get("point")
+    observed = selection.get("source_observation_point")
+    if observed is not None:
+        if not isinstance(observed, str) or observed not in rows:
+            raise ValueError(f"unknown source observation point: {observed}")
+        if portable not in (observed, observed.removesuffix("/entry")):
+            raise ValueError(f"source observation differs from selected point: {portable}:{observed}")
+        return observed, rows[observed]
+    candidates = []
+    for candidate in (portable, portable + "/entry" if isinstance(portable, str) else None,
+                      portable.removesuffix("/entry") if isinstance(portable, str) else None):
+        if candidate in rows and candidate not in candidates:
+            candidates.append(candidate)
+    if len(candidates) != 1:
+        raise ValueError(f"selected point does not identify one activated observation: {portable}")
+    return candidates[0], rows[candidates[0]]
+
+
 def derive(plan_path: Path, session: Path, selection_path: Path, output: Path,
            target_plan_path: Path | None = None) -> dict[str, Any]:
     plan_path, session, selection_path, output = (Path(value).resolve() for value in
@@ -109,17 +135,18 @@ def derive(plan_path: Path, session: Path, selection_path: Path, output: Path,
     result_points = _point_rows(result)
     for point_selection in selection.get("points", []):
         point_id = point_selection.get("point")
-        if point_id not in points or point_id in selected_points:
-            raise ValueError(f"unknown or duplicate selected point: {point_id}")
-        selected_points.add(point_id)
-        target_point_id, target_point = _target_point(point_id, plan, points[point_id], target_plan, target_points)
-        summary = retention.get((generation, point_id))
-        source_retention = points[point_id].get("retention", {})
+        source_point_id, source_point = _source_point(point_selection, plan, points)
+        if source_point_id in selected_points:
+            raise ValueError(f"duplicate selected point: {source_point_id}")
+        selected_points.add(source_point_id)
+        target_point_id, target_point = _target_point(source_point_id, plan, source_point, target_plan, target_points)
+        summary = retention.get((generation, source_point_id))
+        source_retention = source_point.get("retention", {})
         if not summary or summary.get("mode") != source_retention.get("mode") or \
                 summary.get("mode") not in ("first_per_entry_return_address", "first_per_composite_key"):
-            raise ValueError(f"point lacks retained caller evidence: {point_id}")
+            raise ValueError(f"point lacks retained caller evidence: {source_point_id}")
         if summary.get("complete_for_caller_counts") is not True:
-            raise ValueError(f"caller counts are incomplete: {point_id}")
+            raise ValueError(f"caller counts are incomplete: {source_point_id}")
         observed: dict[int, dict[str, Any]] = {}
         for row in summary.get("keys", []):
             address = int(row["entry_return_address"])
@@ -130,13 +157,13 @@ def derive(plan_path: Path, session: Path, selection_path: Path, output: Path,
         if destination is None:
             if source_retention.get("mode") not in ("first_per_entry_return_address", "first_per_composite_key") or \
                     type(source_retention.get("max_keys")) is not int:
-                raise ValueError(f"discovery point lacks a reusable retention policy: {point_id}")
+                raise ValueError(f"discovery point lacks a reusable retention policy: {source_point_id}")
             destination = copy.deepcopy(source_retention)
             destination.pop("exact_callers", None)
             result_points[target_point_id]["retention"]=destination
         if not isinstance(destination, dict) or destination.get("mode") != source_retention.get("mode") or \
                 destination.get("key") != source_retention.get("key"):
-            raise ValueError(f"target point has an incompatible retention policy: {point_id}")
+            raise ValueError(f"target point has an incompatible retention policy: {source_point_id}")
         exact = {(row["module"], int(row["return_rva"])): row
                  for row in destination.get("exact_callers", [])}
         for caller in point_selection.get("callers", []):
@@ -151,19 +178,20 @@ def derive(plan_path: Path, session: Path, selection_path: Path, output: Path,
             address = bases[module] + return_rva
             evidence = observed.get(address)
             if not evidence:
-                raise ValueError(f"selected caller was not observed: {point_id}:{module}+{return_rva:#x}")
+                raise ValueError(f"selected caller was not observed: {source_point_id}:{module}+{return_rva:#x}")
             if int(evidence.get("full_records_persisted", 0)) < 1:
-                raise ValueError(f"selected caller lacks a persisted full sample: {point_id}:{address:#x}")
+                raise ValueError(f"selected caller lacks a persisted full sample: {source_point_id}:{address:#x}")
             refs = caller.get("evidence", [])
             if any(ref not in target_plan["sources"] for ref in refs):
-                raise ValueError(f"selected caller refers to unknown static evidence: {point_id}")
+                raise ValueError(f"selected caller refers to unknown static evidence: {source_point_id}")
             identity = (module, return_rva)
             if identity in exact:
-                raise ValueError(f"caller is already exact-promoted: {point_id}:{module}+{return_rva:#x}")
+                raise ValueError(f"caller is already exact-promoted: {source_point_id}:{module}+{return_rva:#x}")
             row = {"module": module, "return_rva": return_rva,
                    "evidence": list(dict.fromkeys([*refs, source_id]))}
             exact[identity] = row
-            promoted.append({"point": point_id, "module": module, "return_rva": return_rva,
+            promoted.append({"point": point_id, "source_observation_point": source_point_id,
+                             "module": module, "return_rva": return_rva,
                              "target_point": target_point_id,
                              "observed_callbacks": int(evidence["count"]),
                              "persisted_samples": int(evidence["full_records_persisted"])})

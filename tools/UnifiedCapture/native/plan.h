@@ -48,13 +48,15 @@ struct RetentionKeyPart {
     RetentionKeyKind kind=RetentionKeyKind::EntryReturnAddress;uint32_t registerIndex=0;uint64_t mask=~0ull;
 };
 struct AggregateSlot {
-    // fingerprint==0 is empty. The winning callback publishes immutable raw
-    // key parts before ready=1. A concurrent callback never waits for an
-    // interrupted initializer; it records retention_key_busy instead.
+    // fingerprint==0 is empty and fingerprint==1 is a private publication
+    // sentinel. The winner publishes all immutable raw parts before replacing
+    // the sentinel with the real fingerprint. Readers can therefore never
+    // mistake an ordinary publication window for an unclassified callback.
     std::atomic<uint64_t> fingerprint{0};
     std::array<std::atomic<uint64_t>,MaxRetentionKeyParts> parts{};
     std::atomic<uint32_t> ready{0},partCount{0};
     std::atomic<uint64_t> count{0},first{UINT64_MAX},last{0},fullRecords{0},persistedRecords{0};
+    std::atomic<uint64_t> persistedEntries{0},persistedNormalExits{0},persistedPairs{0};
     std::atomic<uint32_t> sampleState{0}; // 0=missing, 1=callback owns attempt, 2=queued
 };
 struct RetentionResult {
@@ -66,6 +68,8 @@ struct ExitSite {
     uint32_t hookId=UINT32_MAX,requiredRedirectSpan=0;void* runtimeHook=nullptr;
 };
 struct Cell {
+    // flags: 1/2 captured enter/leave, 4/8 consumed enter/leave, 16 frame
+    // complete, 32 absent normal exit, 64/128 enter/leave persisted.
     std::atomic<unsigned> state{0},flags{0}; // 0=free,1=initializing,2=active
     std::atomic<uint32_t> readyQueued{0};uint32_t readyNext=UINT32_MAX;
     Record enter,leave;
@@ -121,12 +125,13 @@ struct Point {
     // evidence-backed module-relative return addresses.
     std::vector<uint64_t> exactCallerAddresses;
     std::atomic<uint64_t> aggregateCallbacks{0},aggregateDuplicates{0},aggregateSuppressed{0},aggregateExactCallbacks{0};
+    std::atomic<uint32_t> aggregateKeys{0};
     // First QPC at which an exact per-callback stream became incomplete.
     // This is independent from aggregate caller-count completeness.
     std::atomic<uint64_t> exactCoverageBrokenAt{0};
     Json lastReportedRetention; // Writer thread only.
     Json lastReportedLoss; // Writer thread only, never inspected in a callback.
-    uint64_t coverageBegin=0,coverageEnd=0;
+    std::atomic<uint64_t> coverageBegin{0},coverageEnd{0};
     // Legacy extensions are data readers, never gameplay interpreters.
     std::string legacyReader;unsigned readerKind=0,legacyKind=0;uint64_t legacyUnity=0,legacyVtable=0;size_t legacyBytes=0;
     std::atomic<uint64_t> readSamples{0},readTicks{0},readMax{0};

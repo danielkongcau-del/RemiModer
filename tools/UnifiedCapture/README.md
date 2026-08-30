@@ -29,7 +29,7 @@ UnifiedCapture is a configurable local evidence recorder for Windows x64 process
 
 The library is an observation component, not an injector. Target loading is outside this repository. Mutation hooks, protection changes, and target-specific evidence are outside the public scope.
 
-The local duplex control pipe rejects remote clients, grants access only to the creating Windows user and SYSTEM, and carries a low mandatory label so that a medium-integrity controller owned by the same user can operate an observer loaded by an elevated launcher.
+The local duplex control pipe rejects remote clients, grants access only to the creating Windows user and SYSTEM, and carries a medium mandatory label. This permits the normal same-user medium-integrity controller to operate an observer loaded by an elevated launcher without granting write access to low-integrity processes.
 
 ## Evidence boundaries
 

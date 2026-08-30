@@ -71,6 +71,13 @@ const char* RetentionPartName(RetentionKeyKind kind)noexcept {
 void AssignRetention(Record& record,const RetentionResult& retained)noexcept {
     record.retentionKeyHash=retained.hash;record.retentionEntryReturnAddress=retained.entryReturnAddress;
     record.retentionKeyPartCount=retained.partCount;record.retentionKeyParts=retained.parts;record.retentionExact=retained.exact;}
+void CopyRetention(Record& destination,const Record& source)noexcept {
+    destination.retentionKeyHash=source.retentionKeyHash;
+    destination.retentionEntryReturnAddress=source.retentionEntryReturnAddress;
+    destination.retentionKeyPartCount=source.retentionKeyPartCount;
+    destination.retentionKeyParts=source.retentionKeyParts;
+    destination.retentionExact=source.retentionExact;
+    destination.retentionSlotIndex=source.retentionSlotIndex;}
 }
 Abi GumAbi(GumInvocationContext* ic,bool captureXmm){Abi a;auto* c=ic->cpu_context;if(!c)return a;
     uint64_t values[]={c->rax,c->rbx,c->rcx,c->rdx,c->rsi,c->rdi,c->rbp,c->rsp,c->r8,c->r9,c->r10,c->r11,c->r12,c->r13,c->r14,c->r15,c->rip};
@@ -94,7 +101,8 @@ Runtime::Runtime(fs::path root):outputRoot(std::move(root)){
 Json Runtime::Capabilities()const{return {{"schema","uc.capabilities.v1"},{"architecture","windows-x64"},{"gum_version","17.17.0"},
     {"observer_file",observerPath},{"observer_sha256",observerSha},
     {"control_pipe",{{"remote_clients",false},{"dacl","current-user-and-system"},
-        {"mandatory_label","low-no-write-up"},{"cross_integrity_same_user",true}}},
+        {"mandatory_label","medium-no-write-up"},{"medium-controller-to-elevated-observer",true},
+        {"low_integrity_write",false}}},
     {"backends",{"slot","gum_probe","gum_function_probe_pair"}},
     {"reads",{"scalar","relative","block","array","string"}},
     {"read_predicates",{"eq","neq","in"}},{"predicate_phase","enter"},{"register_value_reads",true},
@@ -107,7 +115,7 @@ Json Runtime::Capabilities()const{return {{"schema","uc.capabilities.v1"},{"arch
         "thread_nesting_capacity","pair_payload_capacity","pair_open_failure","read_failure","truncation",
         "storage_failure","frame_termination_unknown","retention_key_unavailable","retention_key_busy","retention_capacity"}},
     {"point_health_metrics",true},{"mark_capture_checkpoints","bounded-non-atomic-cumulative"},
-    {"record_encoding","uc.record.v3-compact-binary-with-manifest-dictionary-and-raw-retention-key"},
+    {"chunk_record_encoding","uc.record.v2"},{"event_metadata_encoding","UCEVT003"},
     {"admission_window_accounting",true},{"forced_stop",true},
     {"probe_pair_tls_frame_capacity",256},{"storage_backpressure","nonblocking-bounded-loss-accounted"},
     {"gum_raw_registers",RegNames},{"gum_xmm_registers",16},{"legacy_raw_registers",0},
@@ -216,15 +224,18 @@ Json Runtime::Apply(std::shared_ptr<Generation> gen){std::lock_guard lock(stateM
     try{
         auto ensure=[&](uint64_t address,uint64_t original,Backend backend,const std::string& abi,const Bytes& prefix,const std::string& label){
             Hook* h=nullptr;for(auto& old:hooks)if(old->target==address){h=old.get();break;}
-            if(!h){const size_t reserve=backend==Backend::Slot?8:16;
-                for(const auto& old:hooks)if(old->owned){const size_t oldReserve=old->reservedSpan?old->reservedSpan:(old->backend==Backend::Slot?8:16);
-                    const uint64_t oldEnd=Add(old->target,oldReserve),newEnd=Add(address,reserve);
-                    Require(oldEnd<=address||newEnd<=old->target,"partial physical hook reservation overlap");}
-                auto created=std::make_unique<Hook>();h=created.get();h->id=(uint32_t)hooks.size();h->target=address;h->original=original;
+            if(!h){auto created=std::make_unique<Hook>();h=created.get();h->id=(uint32_t)hooks.size();h->target=address;h->original=original;
                 h->backend=backend;h->abi=abi;hooks.push_back(std::move(created));}
             Require(h->backend==backend&&h->abi==abi&&h->original==original,"existing hook has a different mechanism/ABI");
             Require(!h->conflict,"hook ownership conflict");
-            if(!h->owned){Point site;site.id=label;site.address=address;site.original=original;site.backend=backend;site.abi=abi;site.prefix=prefix;
+            if(!h->owned){const size_t reserve=h->reservedSpan?h->reservedSpan:(backend==Backend::Slot?8:16);
+                // Re-check every physical installation, including resurrection
+                // of a detached Hook object from an older generation. Object
+                // reuse must never bypass current owned-site reservations.
+                for(const auto& old:hooks)if(old.get()!=h&&old->owned){const size_t oldReserve=old->reservedSpan?old->reservedSpan:(old->backend==Backend::Slot?8:16);
+                    const uint64_t oldEnd=Add(old->target,oldReserve),newEnd=Add(address,reserve);
+                    Require(oldEnd<=address||newEnd<=old->target,"partial physical hook reservation overlap");}
+                Point site;site.id=label;site.address=address;site.original=original;site.backend=backend;site.abi=abi;site.prefix=prefix;
                 h->installGeneration=next;added.push_back(h);Install(*h,site);}
             else {Require(h->sourcePrefix==prefix,"owned hook source prefix changed");Bytes current(h->installed.size());
                 Require(Read(h->target,current.data(),current.size())&&current==ExpectedPrefix(*h),"owned hook was modified");}
@@ -271,8 +282,8 @@ Json Runtime::Apply(std::shared_ptr<Generation> gen){std::lock_guard lock(stateM
         // Publication below is allocation-free and non-throwing. Coverage uses
         // the measured commit boundary, not the earlier manifest preparation.
         const uint64_t published=Clock();auto previous=active.load(std::memory_order_acquire);
-        if(previous)for(auto& p:previous->points)if(!p->coverageEnd)p->coverageEnd=published;
-        for(auto& p:gen->points)p->coverageBegin=published;
+        if(previous)for(auto& p:previous->points)if(!p->coverageEnd.load(std::memory_order_relaxed))p->coverageEnd.store(published,std::memory_order_relaxed);
+        for(auto& p:gen->points)p->coverageBegin.store(published,std::memory_order_relaxed);
         generationCounter=next;moduleInvalid=false;lastModuleCheck=published;
         active.store(gen,std::memory_order_release);admitting.store(true,std::memory_order_release);
         return result;
@@ -431,8 +442,10 @@ void Runtime::Probe(Hook& h,GumInvocationContext* context) noexcept {
             pairs.Release(*payload);return;}
         if(payload->cell){if(p.captureXmm)captureXmm();auto& e=payload->cell->leave;e.id=hot.eventIds.fetch_add(1);e.invocation=frame.invocation;
             e.parent=payload->cell->enter.parent;e.parentKnown=payload->cell->enter.parentKnown;e.exitHookId=absent?UINT32_MAX:h.id;
+            CopyRetention(e,payload->cell->enter);
             if(absent){e.abi=abi;e.qpc=Clock();e.endQpc=e.qpc;e.tid=GetCurrentThreadId();e.used=0;e.exceptional=false;
                 for(auto& read:e.reads)read={};p.recordsCaptured.fetch_add(1,std::memory_order_relaxed);
+                p.BreakExactCoverage(e.qpc);p.loss.Note(e.qpc,1,0,true,LossReason::FrameTerminationUnknown);
                 payload->cell->flags.fetch_or(2|16|32,std::memory_order_release);}
             else {Capture(p,e,abi,payload->cell->enter.abi,2);p.recordsCaptured.fetch_add(1,std::memory_order_relaxed);
                 payload->cell->flags.fetch_or(2|16,std::memory_order_release);}
@@ -466,9 +479,10 @@ void Runtime::Probe(Hook& h,GumInvocationContext* context) noexcept {
         if(cell){auto& e=cell->enter;e.id=id;e.invocation=0;e.parent=0;e.parentKnown=false;
             AssignRetention(e,retained);e.retentionSlotIndex=retained.slot?
                 (uint32_t)(retained.slot-p.aggregates.get()):UINT32_MAX;
-            if(Capture(p,e,abi,abi,1)){p.recordsCaptured.fetch_add(1,std::memory_order_relaxed);cell->flags.fetch_or(1|8|16,std::memory_order_release);p.QueueReady(cell);
+            if(Capture(p,e,abi,abi,1)){p.recordsCaptured.fetch_add(1,std::memory_order_relaxed);cell->flags.fetch_or(1|8|16,std::memory_order_release);
                 if(retained.slot){retained.slot->fullRecords.fetch_add(1,std::memory_order_relaxed);
-                    if(!retained.exact)retained.slot->sampleState.store(2,std::memory_order_release);}}
+                    if(!retained.exact)retained.slot->sampleState.store(2,std::memory_order_release);}
+                p.QueueReady(cell);}
             else {if(retained.slot&&!retained.exact)retained.slot->sampleState.store(0,std::memory_order_release);
                 cell->state.store(0,std::memory_order_release);p.freeSlots.fetch_add(1,std::memory_order_release);}}
         else {if(retained.slot&&!retained.exact)retained.slot->sampleState.store(0,std::memory_order_release);
@@ -534,7 +548,7 @@ void Runtime::End(Hook&,const Abi& abi,Token& token,bool exceptional) noexcept {
     p.inFlight.fetch_sub(1);const_cast<Generation*>(token.generation.get())->inFlight.fetch_sub(1);
     hot.entrants.fetch_sub(1);
 }
-void Runtime::WriteRecord(const Generation& gen,Point& point,const Record& e,const char* kind){
+bool Runtime::WriteRecord(const Generation& gen,Point& point,const Record& e,const char* kind){
     const uint32_t kindCode=EvidenceKind(kind);Require(kindCode,"unknown binary event kind");
     uint32_t flags=(e.parentKnown?1U:0U)|(e.exceptional?2U:0U)|(e.retentionExact?8U:0U)|
         (e.legacyTruncated?16U:0U)|(e.retentionKeyPartCount?32U:0U)|(e.exitHookId!=UINT32_MAX?64U:0U);
@@ -556,10 +570,17 @@ void Runtime::WriteRecord(const Generation& gen,Point& point,const Record& e,con
         EvidencePut(rawMetadata,r.begin);EvidencePut(rawMetadata,r.bytes);EvidencePut(rawMetadata,r.status);}
     point.recordsStoreAttempted.fetch_add(1,std::memory_order_relaxed);
     try{store->RawEvent(e.id,e.qpc,rawMetadata.data(),rawMetadata.size(),e.bytes.data(),e.used);point.recordsEncoded.fetch_add(1,std::memory_order_relaxed);
-        if(e.retentionSlotIndex<point.aggregateCapacity)point.aggregates[e.retentionSlotIndex].persistedRecords.fetch_add(1,std::memory_order_relaxed);}
+        if(e.retentionSlotIndex<point.aggregateCapacity){auto& slot=point.aggregates[e.retentionSlotIndex];slot.persistedRecords.fetch_add(1,std::memory_order_relaxed);
+            if(kindCode==1||kindCode==2||kindCode==5)slot.persistedEntries.fetch_add(1,std::memory_order_relaxed);
+            else if(kindCode==3)slot.persistedNormalExits.fetch_add(1,std::memory_order_relaxed);}
+        return true;}
     catch(const StoreBackpressure&){const auto qpc=Clock();if(point.retention==RetentionMode::Full||e.retentionExact)point.BreakExactCoverage(qpc);
-        point.loss.Note(qpc,1,rawMetadata.size()+e.used,false,LossReason::StoreBackpressure);}
+        if(e.retentionSlotIndex<point.aggregateCapacity&&!e.retentionExact){uint32_t queued=2;
+            point.aggregates[e.retentionSlotIndex].sampleState.compare_exchange_strong(queued,0,std::memory_order_acq_rel);}
+        point.loss.Note(qpc,1,rawMetadata.size()+e.used,false,LossReason::StoreBackpressure);return false;}
     catch(...){const auto qpc=Clock();if(point.retention==RetentionMode::Full||e.retentionExact)point.BreakExactCoverage(qpc);
+        if(e.retentionSlotIndex<point.aggregateCapacity&&!e.retentionExact){uint32_t queued=2;
+            point.aggregates[e.retentionSlotIndex].sampleState.compare_exchange_strong(queued,0,std::memory_order_acq_rel);}
         point.loss.Note(qpc,1,rawMetadata.size()+e.used,false,LossReason::StorageFailure);throw;}
 }
 Json Runtime::PointSnapshot(const Generation& gen,const Point& p){
@@ -569,11 +590,11 @@ Json Runtime::PointSnapshot(const Generation& gen,const Point& p){
     const auto broken=p.exactCoverageBrokenAt.load(std::memory_order_relaxed);
     const bool hasExactLane=p.retention==RetentionMode::Full||!p.exactCallerAddresses.empty();
     snapshot["exact_stream_state"]=!hasExactLane?"NOT_APPLICABLE":broken?"BROKEN_WITH_GAPS":"COMPLETE_SO_FAR";
-    snapshot["exact_coverage_begin_qpc"]=hasExactLane?Json(p.coverageBegin):Json(nullptr);
+    snapshot["exact_coverage_begin_qpc"]=hasExactLane?Json(p.coverageBegin.load(std::memory_order_relaxed)):Json(nullptr);
     snapshot["exact_coverage_end_qpc"]=broken?Json(broken):Json(nullptr);
     return snapshot;}
 Json Runtime::PointMetricsSnapshot(const Generation& gen,const Point& p,uint64_t now){
-    const auto begin=p.coverageBegin;const auto elapsed=begin&&now>begin?now-begin:0;
+    const auto begin=p.coverageBegin.load(std::memory_order_relaxed);const auto elapsed=begin&&now>begin?now-begin:0;
     const auto callbacks=p.callbacksObserved.load(std::memory_order_relaxed);
     const auto captured=p.recordsCaptured.load(std::memory_order_relaxed);
     const auto attempted=p.recordsStoreAttempted.load(std::memory_order_relaxed);
@@ -605,7 +626,8 @@ void Runtime::ReportLoss(const Generation& gen,Point& p,uint64_t now){
             {"counting","cumulative-per-point-generation"},{"loss",snapshot}});p.lastReportedLoss=std::move(snapshot);}
 }
 Json Runtime::RetentionSnapshot(const Generation& gen,const Point& p){
-    Json keys=Json::array();uint64_t classified=0,keyCount=0,persistedSamples=0,exactPersisted=0;
+    Json keys=Json::array();uint64_t classified=0,keyCount=0,persistedSamples=0;
+    uint64_t exactEntries=0,exactNormalExits=0,exactPairs=0;
     for(uint32_t i=0;i<p.aggregateCapacity;++i){const auto& slot=p.aggregates[i];auto hash=slot.fingerprint.load(std::memory_order_acquire);
         if(!hash||!slot.ready.load(std::memory_order_acquire))continue;++keyCount;auto count=slot.count.load(std::memory_order_relaxed);classified+=count;
         const auto partCount=slot.partCount.load(std::memory_order_relaxed);Json parts=Json::array();
@@ -614,12 +636,17 @@ Json Runtime::RetentionSnapshot(const Generation& gen,const Point& p){
             if(spec.kind==RetentionKeyKind::EntryReturnAddress)caller=value;
             else part["register"]=RegNames[spec.registerIndex];parts.push_back(std::move(part));}
         const auto captured=slot.fullRecords.load(std::memory_order_relaxed),persisted=slot.persistedRecords.load(std::memory_order_relaxed);
+        const auto persistedEntries=slot.persistedEntries.load(std::memory_order_relaxed);
+        const auto persistedNormalExits=slot.persistedNormalExits.load(std::memory_order_relaxed);
+        const auto persistedPairs=slot.persistedPairs.load(std::memory_order_relaxed);
         const bool exact=std::binary_search(p.exactCallerAddresses.begin(),p.exactCallerAddresses.end(),caller);
-        if(persisted)++persistedSamples;if(exact)exactPersisted+=persisted;
+        if(persistedEntries)++persistedSamples;if(exact){exactEntries+=persistedEntries;exactNormalExits+=persistedNormalExits;exactPairs+=persistedPairs;}
         keys.push_back({{"key_hash",hash},{"key_parts",parts},{"entry_return_address",caller},{"count",count},
             {"first_qpc",slot.first.load()==UINT64_MAX?0:slot.first.load()},{"last_qpc",slot.last.load()},
             {"lane",exact?"exact_promoted":"aggregate_first_sample"},
-            {"full_records_enqueued",captured},{"full_records_captured",captured},{"full_records_persisted",persisted}});}
+            {"full_records_enqueued",captured},{"full_records_captured",captured},{"full_records_persisted",persisted},
+            {"entries_persisted",persistedEntries},{"normal_exits_persisted",persistedNormalExits},
+            {"exact_pairs_persisted",persistedPairs}});}
     const auto keyUnavailable=p.loss.reasons[(size_t)LossReason::RetentionKeyUnavailable].events.load();
     const auto keyBusy=p.loss.reasons[(size_t)LossReason::RetentionKeyBusy].events.load();
     const auto capacityOverflow=p.loss.reasons[(size_t)LossReason::RetentionCapacity].events.load();
@@ -628,8 +655,10 @@ Json Runtime::RetentionSnapshot(const Generation& gen,const Point& p){
         {"callbacks",callbacks},{"classified_callbacks",classified},
         {"duplicate_key_callbacks",p.aggregateDuplicates.load()},{"suppressed_by_policy",p.aggregateSuppressed.load()},
         {"exact_promoted_callers",p.exactCallerAddresses.size()},{"exact_promoted_callbacks",exactCallbacks},
-        {"exact_promoted_records_persisted",exactPersisted},
-        {"classified_exact_records_complete_so_far",exactPersisted==exactCallbacks},
+        {"exact_promoted_records_persisted",exactEntries},{"exact_entries_persisted",exactEntries},
+        {"exact_normal_exits_persisted",exactNormalExits},{"exact_pairs_persisted",exactPairs},
+        {"classified_exact_records_complete_so_far",p.mode==PointMode::Single?
+            exactEntries==exactCallbacks:exactPairs==exactCallbacks},
         {"max_keys",p.aggregateCapacity},{"keys",std::move(keys)},
         {"retention_key_unavailable",keyUnavailable},{"retention_key_busy",keyBusy},{"retention_capacity_overflow",capacityOverflow},
         {"complete_for_caller_counts",p.retention==RetentionMode::Full||
@@ -672,12 +701,16 @@ void Runtime::Tick(){
             while(index!=UINT32_MAX){Require(index<p->poolSize,"ready queue cell index");Cell& c=p->pool[index];const uint32_t next=c.readyNext;
                 p->readyDepth.fetch_sub(1,std::memory_order_relaxed);
                 if(c.state.load(std::memory_order_acquire)==2){auto flags=c.flags.load(std::memory_order_acquire);
-                    if((flags&1)&&!(flags&4)){try{WriteRecord(*gen,*p,c.enter,EntryKind(*p,c.enter));}
+                    if((flags&1)&&!(flags&4)){try{if(WriteRecord(*gen,*p,c.enter,EntryKind(*p,c.enter)))c.flags.fetch_or(64,std::memory_order_release);}
                         catch(...){c.flags.fetch_or(4,std::memory_order_release);throw;}c.flags.fetch_or(4);}
                     flags=c.flags.load(std::memory_order_acquire);
-                    if((flags&2)&&!(flags&8)){try{WriteRecord(*gen,*p,c.leave,(flags&32)?"frame_absent_after_observed_point":"leave");}
+                    if((flags&2)&&!(flags&8)){try{if(WriteRecord(*gen,*p,c.leave,(flags&32)?"frame_absent_after_observed_point":"leave"))c.flags.fetch_or(128,std::memory_order_release);}
                         catch(...){c.flags.fetch_or(8,std::memory_order_release);throw;}c.flags.fetch_or(8);}
                     if((c.flags.load(std::memory_order_acquire)&(4|8|16))==(4|8|16)){
+                        const auto done=c.flags.load(std::memory_order_acquire);
+                        if(c.enter.retentionExact&&c.enter.retentionSlotIndex<p->aggregateCapacity&&!(done&32)&&
+                                (done&(64|128))==(64|128))
+                            p->aggregates[c.enter.retentionSlotIndex].persistedPairs.fetch_add(1,std::memory_order_relaxed);
                         c.readyQueued.store(0,std::memory_order_release);c.state.store(0,std::memory_order_release);
                         p->freeSlots.fetch_add(1,std::memory_order_release);
                     }else {c.readyQueued.store(0,std::memory_order_release);flags=c.flags.load(std::memory_order_acquire);
@@ -687,7 +720,7 @@ void Runtime::Tick(){
         auto current=active.load(std::memory_order_acquire);
         if(current&&!moduleInvalid){bool valid=true;for(const auto& m:current->modules)valid&=ModuleStillLoaded(m);
             if(valid)lastModuleCheck=Clock();else {moduleInvalid=true;admitting.store(false);
-                for(auto& p:current->points)p->coverageEnd=lastModuleCheck;
+                for(auto& p:current->points)p->coverageEnd.store(lastModuleCheck,std::memory_order_relaxed);
                 Meta({{"kind","module_binding_invalidated"},{"generation",current->generation},{"last_verified_qpc",lastModuleCheck},
                     {"noticed_qpc",Clock()},{"exact_unload_qpc",nullptr}});
                 for(auto& h:hooks)for(const auto& m:current->modules)if(!ModuleStillLoaded(m)&&
@@ -736,7 +769,9 @@ void Runtime::Tick(){
                 Json loss=archivedLoss;for(const auto& gen:generations)for(const auto& p:gen->points){
                     ReportLoss(*gen,*p,Clock());ReportRetention(*gen,*p,Clock());loss.push_back(PointSnapshot(*gen,*p));
                     store->Meta({{"kind","coverage"},{"point",p->id},{"generation",gen->generation},
-                        {"begin_qpc",p->coverageBegin},{"end_qpc",p->coverageEnd?p->coverageEnd:stopQpc},{"complete",false}});}
+                        {"begin_qpc",p->coverageBegin.load(std::memory_order_relaxed)},
+                        {"end_qpc",p->coverageEnd.load(std::memory_order_relaxed)?p->coverageEnd.load(std::memory_order_relaxed):stopQpc},
+                        {"complete",false}});}
                 ReportAdmissionWindow();
                 {std::deque<Json> rows;{std::lock_guard ml(metaMutex);rows.swap(metadata);}for(auto& row:rows)store->Meta(row);}
                 terminalCallbacks.store(true,std::memory_order_release);
@@ -746,8 +781,10 @@ void Runtime::Tick(){
                 if(h->listener&&h->detached&&!gum_interceptor_flush_listener(interceptor,h->listener))released=false;}
             for(const auto& gen:generations)for(const auto& p:gen->points)if(p->readyDepth.load())released=false;
             if(released){Json loss=archivedLoss;for(const auto& gen:generations)for(const auto& p:gen->points){ReportLoss(*gen,*p,Clock());ReportRetention(*gen,*p,Clock());loss.push_back(PointSnapshot(*gen,*p));
-                    store->Meta({{"kind","coverage"},{"point",p->id},{"generation",gen->generation},{"begin_qpc",p->coverageBegin},
-                        {"end_qpc",p->coverageEnd?p->coverageEnd:stopQpc},{"complete",true}});}
+                    const auto coverageEnd=p->coverageEnd.load(std::memory_order_relaxed);
+                    store->Meta({{"kind","coverage"},{"point",p->id},{"generation",gen->generation},
+                        {"begin_qpc",p->coverageBegin.load(std::memory_order_relaxed)},
+                        {"end_qpc",coverageEnd?coverageEnd:stopQpc},{"complete",true}});}
                 ReportAdmissionWindow();
                 // Commit pending hook teardown metadata before the final session seal.
                 {std::deque<Json> rows;{std::lock_guard ml(metaMutex);rows.swap(metadata);}for(auto& row:rows)store->Meta(row);}
@@ -764,8 +801,9 @@ void Runtime::Archive(const Generation& gen){for(auto& p:gen.points){const auto 
     auto retention=RetentionSnapshot(gen,*p);if(p->retention!=RetentionMode::Full)archivedRetention.push_back(retention);
     auto metrics=PointMetricsSnapshot(gen,*p,now);archivedMetrics.push_back(metrics);
     store->Meta({{"kind","generation_point_retired"},{"generation",gen.generation},{"point",p->id},{"loss",loss},{"retention",retention},{"point_metrics",metrics},{"qpc",now}});
-    store->Meta({{"kind","coverage"},{"point",p->id},{"generation",gen.generation},{"begin_qpc",p->coverageBegin},
-        {"end_qpc",p->coverageEnd},{"complete",true}});}}
+    store->Meta({{"kind","coverage"},{"point",p->id},{"generation",gen.generation},
+        {"begin_qpc",p->coverageBegin.load(std::memory_order_relaxed)},
+        {"end_qpc",p->coverageEnd.load(std::memory_order_relaxed)},{"complete",true}});}}
 void Runtime::NewSession(){
     // Called under stateMutex, and only after the previous session's clean seal.
     Require(clean,"previous session not clean");auto replacement=std::make_unique<Store>(outputRoot);
@@ -788,14 +826,24 @@ void Runtime::Stop(bool force){std::lock_guard lock(stateMutex);
 void Runtime::Start(){std::lock_guard lock(stateMutex);Require(!stopRequested.load()&&!clean,"session is draining/stopped");
     {std::lock_guard errorLock(errorMutex);Require(storageError.empty(),"storage failed");}Require(!store->SealFailed(),"storage failed");
     Require(active.load()!=nullptr,"apply a plan first");admitting.store(true);}
-Json Runtime::Mark(const std::string& label){std::lock_guard lock(stateMutex);Require(!clean&&!stopRequested.load()&&!closeInitiated,"session is draining/stopped");
-    {std::lock_guard errorLock(errorMutex);Require(storageError.empty(),"storage failed");}Require(!store->SealFailed(),"storage failed");
-    const uint64_t checkpointId=++markCounter,snapshotBegin=Clock();Json loss=archivedLoss,retention=archivedRetention,metrics=archivedMetrics;
-    for(const auto& gen:generations)for(const auto& p:gen->points){loss.push_back(PointSnapshot(*gen,*p));
+Json Runtime::Mark(const std::string& label){
+    std::vector<std::shared_ptr<Generation>> snapshotGenerations;Json loss,retention,metrics,storageSnapshot;
+    uint64_t checkpointId=0,snapshotGeneration=0,snapshotBegin=0;
+    {std::lock_guard lock(stateMutex);Require(!clean&&!stopRequested.load()&&!closeInitiated,"session is draining/stopped");
+        {std::lock_guard errorLock(errorMutex);Require(storageError.empty(),"storage failed");}Require(!store->SealFailed(),"storage failed");
+        checkpointId=++markCounter;snapshotGeneration=generationCounter;snapshotGenerations=generations;
+        loss=archivedLoss;retention=archivedRetention;metrics=archivedMetrics;snapshotBegin=Clock();
+        // Store's current payload is worker-owned under stateMutex. Copy its
+        // cheap status projection here; never race Status() with RawEvent().
+        storageSnapshot=store->Status();}
+    // Snapshot immutable generation ownership and release stateMutex before
+    // walking aggregate tables, building JSON or fsyncing.
+    // The worker must remain free to drain ready cells while a mark is made.
+    for(const auto& gen:snapshotGenerations)for(const auto& p:gen->points){loss.push_back(PointSnapshot(*gen,*p));
         if(p->retention!=RetentionMode::Full)retention.push_back(RetentionSnapshot(*gen,*p));
         metrics.push_back(PointMetricsSnapshot(*gen,*p,snapshotBegin));}
-    const auto storageSnapshot=store->Status();const uint64_t snapshotEnd=Clock();Json checkpoint={{"kind","capture_checkpoint"},{"schema","uc.CaptureCheckpoint.v1"},
-        {"checkpoint_id",checkpointId},{"label",label},{"generation_counter",generationCounter},
+    const uint64_t snapshotEnd=Clock();Json checkpoint={{"kind","capture_checkpoint"},{"schema","uc.CaptureCheckpoint.v1"},
+        {"checkpoint_id",checkpointId},{"label",label},{"generation_counter",snapshotGeneration},
         {"snapshot_begin_qpc",snapshotBegin},{"snapshot_end_qpc",snapshotEnd},{"snapshot_atomic",false},
         {"snapshot_consistency","bounded_non_atomic_cumulative"},{"loss",loss},{"retention",retention},
         {"point_metrics",metrics},{"storage",storageSnapshot},
@@ -803,11 +851,25 @@ Json Runtime::Mark(const std::string& label){std::lock_guard lock(stateMutex);Re
         {"unattributed_storage_loss_events",unattributedStorageLoss.load()}};
     Meta(checkpoint);Meta({{"kind","user_mark"},{"label",label},{"qpc",snapshotEnd},{"checkpoint_id",checkpointId},
         {"native_semantics",false}});FlushMetaDurable();
-    return {{"checkpoint_id",checkpointId},{"label",label},{"snapshot_begin_qpc",snapshotBegin},
+    return {{"checkpoint_id",checkpointId},{"label",label},{"generation",snapshotGeneration},{"snapshot_begin_qpc",snapshotBegin},
         {"snapshot_end_qpc",snapshotEnd},{"snapshot_atomic",false}};}
-Json Runtime::Status()const{std::lock_guard lock(stateMutex);Json loss=archivedLoss,retention=archivedRetention,ownership=Json::array(),timing=Json::array(),metrics=archivedMetrics;uint64_t calls=0,queued=0,memory=0;
+Json Runtime::Status()const{std::vector<std::shared_ptr<Generation>> snapshotGenerations;
+    Json loss,retention,ownership=Json::array(),timing=Json::array(),metrics,storageSnapshot;
+    uint64_t snapshotGeneration=0,residentGenerations=0;bool snapshotForced=false,snapshotClean=false,
+        snapshotStopping=false,snapshotModuleInvalid=false,snapshotActive=false;std::string persistedError;
+    {std::lock_guard lock(stateMutex);snapshotGenerations=generations;loss=archivedLoss;retention=archivedRetention;metrics=archivedMetrics;
+        snapshotGeneration=generationCounter;residentGenerations=generations.size();snapshotForced=forcedTerminal;snapshotClean=clean;
+        snapshotStopping=stopRequested.load();snapshotModuleInvalid=moduleInvalid;snapshotActive=active.load()!=nullptr;
+        storageSnapshot=store->Status();
+        for(const auto& h:hooks)ownership.push_back({{"hook_id",h->id},{"target",h->target},{"reserved_span",h->reservedSpan},
+            {"required_redirect_span",h->patchSpan},{"owned",h->owned},{"conflict",h->conflict},
+            {"detached",h->detached},{"executing",h->executing.load()},{"error",h->error}});
+        std::lock_guard errorLock(errorMutex);persistedError=storageError;}
+    uint64_t calls=0,queued=0,memory=0;
     const auto snapshotQpc=Clock();
-    for(const auto& gen:generations){calls+=gen->inFlight.load();for(const auto& p:gen->points){loss.push_back(PointSnapshot(*gen,*p));
+    // As with Mark, immutable generation ownership lets expensive aggregate
+    // and pool projections run without preventing the worker from draining.
+    for(const auto& gen:snapshotGenerations){calls+=gen->inFlight.load();for(const auto& p:gen->points){loss.push_back(PointSnapshot(*gen,*p));
         memory+=p->poolSize*(sizeof(Cell)+2*(p->blobCapacity+p->ops.size()*sizeof(ReadResult)))+p->aggregateCapacity*sizeof(AggregateSlot);
         if(p->retention!=RetentionMode::Full)retention.push_back(RetentionSnapshot(*gen,*p));
         timing.push_back({{"point",p->id},{"generation",gen->generation},{"samples",p->readSamples.load()},
@@ -815,19 +877,16 @@ Json Runtime::Status()const{std::lock_guard lock(stateMutex);Json loss=archivedL
             {"filtered_by_plan",p->filtered.load()}});
         metrics.push_back(PointMetricsSnapshot(*gen,*p,snapshotQpc));
         for(uint32_t i=0;i<p->poolSize;++i)if(p->pool[i].state.load())++queued;}}
-    for(const auto& h:hooks)ownership.push_back({{"hook_id",h->id},{"target",h->target},{"reserved_span",h->reservedSpan},
-        {"required_redirect_span",h->patchSpan},{"owned",h->owned},{"conflict",h->conflict},
-        {"detached",h->detached},{"executing",h->executing.load()},{"error",h->error}});
     PROCESS_MEMORY_COUNTERS_EX pm{};pm.cb=sizeof(pm);GetProcessMemoryInfo(GetCurrentProcess(),(PROCESS_MEMORY_COUNTERS*)&pm,sizeof(pm));
-    std::lock_guard errorLock(errorMutex);auto persistedError=storageError.empty()?store->SealErrorText():storageError;
-    return {{"ok",true},{"state",forcedTerminal?"STOPPED_FORCED":clean?"STOPPED_CLEAN":stopRequested.load()?"DRAIN_PENDING":
-            !persistedError.empty()?"STORAGE_FAILED":moduleInvalid?"MODULE_REBIND_PENDING":active.load()?"RUNNING":"IDLE"},
-        {"generation",generationCounter},{"in_flight",calls},{"queued_cells",queued},{"loss",loss},{"retention",retention},{"hooks",ownership},
-        {"resident_generations",generations.size()},{"preallocated_record_bytes",memory},
-        {"read_timing",timing},{"point_metrics",metrics},{"snapshot_qpc",snapshotQpc},{"qpc_frequency",Frequency()},
+    if(persistedError.empty())persistedError=store->SealErrorText();
+    return {{"ok",true},{"state",snapshotForced?"STOPPED_FORCED":snapshotClean?"STOPPED_CLEAN":snapshotStopping?"DRAIN_PENDING":
+            !persistedError.empty()?"STORAGE_FAILED":snapshotModuleInvalid?"MODULE_REBIND_PENDING":snapshotActive?"RUNNING":"IDLE"},
+        {"generation",snapshotGeneration},{"in_flight",calls},{"queued_cells",queued},{"loss",loss},{"retention",retention},{"hooks",ownership},
+        {"resident_generations",residentGenerations},{"preallocated_record_bytes",memory},
+        {"read_timing",timing},{"point_metrics",metrics},{"snapshot_qpc",snapshotQpc},{"qpc_frequency",Frequency()},{"snapshot_atomic",false},
         {"admission_window_drops",admission.drops.load()},
         {"unattributed_storage_loss_events",unattributedStorageLoss.load()},
-        {"process_working_set_bytes",pm.WorkingSetSize},{"process_private_bytes",pm.PrivateUsage},{"storage",store->Status()},
+        {"process_working_set_bytes",pm.WorkingSetSize},{"process_private_bytes",pm.PrivateUsage},{"storage",storageSnapshot},
         {"storage_error",persistedError},{"directory",store->Path()},
         {"session_id",store->Id()},{"automatic_stop",false}};
 }
@@ -836,8 +895,8 @@ Json Runtime::RebindPlan()const{std::lock_guard lock(stateMutex);if(!moduleInval
     for(auto& h:hooks)if(h->owned||h->conflict||h->listener||h->executing.load())return nullptr;
     auto gen=active.load(std::memory_order_acquire);return gen?gen->source:Json(nullptr);}
 void Runtime::FlushMetaDurable(){
-    // Called under stateMutex from control paths: queue the runtime metadata
-    // into the store and force it onto the disk before the call returns.
+    // Runtime metadata and Store's manifest append path are independently
+    // serialized; callers do not need to hold stateMutex across disk I/O.
     std::deque<Json> rows;{std::lock_guard ml(metaMutex);rows.swap(metadata);}
     for(auto& row:rows)store->Meta(std::move(row));
     store->FlushMeta();}
