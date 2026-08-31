@@ -1,0 +1,40 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "uc.controller-completion-state.v1",
+  "title": "Computed finite native controller acquisition state",
+  "type": "object",
+  "required": ["schema", "contract_id", "definition", "sources", "claims", "summary", "acceptance", "next_work_policy"],
+  "properties": {
+    "schema": {"const": "uc.controller-completion-state.v1"},
+    "contract_id": {"const": "RemielleOrigin.native-controller-acquisition.v1"},
+    "definition": {"type": "string"},
+    "sources": {"type": "object"},
+    "claims": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "title", "scope", "status", "reason", "evidence", "facts"],
+        "properties": {
+          "id": {"type": "string"},
+          "title": {"type": "string"},
+          "scope": {"enum": ["CORE_REQUIRED", "VALIDATION_OPTIONAL", "ENGINE_APPENDIX", "OUT_OF_SCOPE"]},
+          "status": {"enum": ["OPEN", "CLOSED", "CLOSED_OPAQUE", "ENVIRONMENT_UNAVAILABLE", "OUT_OF_SCOPE"]},
+          "reason": {"type": "string"},
+          "evidence": {"type": "array"},
+          "facts": {"type": "object"}
+        },
+        "additionalProperties": false
+      }
+    },
+    "summary": {
+      "type": "object",
+      "required": ["core_claims", "core_closed", "core_open", "optional_claims", "open_core_claim_ids"]
+    },
+    "acceptance": {
+      "type": "object",
+      "required": ["definition_acquisition_complete", "runtime_required_now", "representative_trace_validation_complete", "independent_reimplementation_complete"]
+    },
+    "next_work_policy": {"type": "object"}
+  },
+  "additionalProperties": false
+}

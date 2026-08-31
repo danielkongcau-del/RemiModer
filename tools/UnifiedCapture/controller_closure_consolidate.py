@@ -1,4 +1,12 @@
-"""Consolidate current controller evidence without reviving superseded gaps."""
+"""Build the historical rolling controller-evidence ledger.
+
+This pipeline intentionally retains its legacy ``complete_controller=False``
+field and must not be used as the terminal completion authority.  Finite
+completion is computed by ``controller_completion_contract.py`` from the
+immutable native evidence graph.  Keeping the old ledger read-compatible
+preserves every prior evidence join without letting its expanding work queue
+redefine the frozen controller denominator.
+"""
 from __future__ import annotations
 
 import argparse

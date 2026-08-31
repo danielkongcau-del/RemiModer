@@ -1,0 +1,37 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "uc.controller-completion-contract.v1",
+  "title": "Finite native controller acquisition completion contract",
+  "type": "object",
+  "required": ["schema", "contract_id", "scope", "statuses", "core_terminal_statuses", "core_claims", "optional_claims", "completion_rule"],
+  "properties": {
+    "schema": {"const": "uc.controller-completion-contract.v1"},
+    "contract_id": {"const": "RemielleOrigin.native-controller-acquisition.v1"},
+    "scope": {"type": "object"},
+    "statuses": {
+      "type": "array",
+      "items": {"enum": ["OPEN", "CLOSED", "CLOSED_OPAQUE", "ENVIRONMENT_UNAVAILABLE", "OUT_OF_SCOPE"]},
+      "uniqueItems": true
+    },
+    "core_terminal_statuses": {
+      "const": ["CLOSED", "CLOSED_OPAQUE"]
+    },
+    "core_claims": {
+      "type": "array",
+      "minItems": 14,
+      "maxItems": 14,
+      "items": {
+        "type": "object",
+        "required": ["id", "title"],
+        "properties": {
+          "id": {"pattern": "^C(0[1-9]|1[0-4])$"},
+          "title": {"type": "string", "minLength": 1}
+        },
+        "additionalProperties": false
+      }
+    },
+    "optional_claims": {"type": "array"},
+    "completion_rule": {"type": "object"}
+  },
+  "additionalProperties": false
+}

@@ -2,7 +2,9 @@
 
 This repository contains a generic, local-first runtime evidence recorder for Windows x64 processes.
 
-The public tree intentionally excludes target binaries, extracted assets, runtime captures, decoded metadata, target-specific plans, addresses, hashes, names, and research conclusions. Those materials remain local and are blocked by repository ignore rules.
+The public tree intentionally excludes target binaries, extracted assets, runtime captures, decoded metadata, target-specific plans, and raw address/hash/name catalogs. Those materials remain local and are blocked by repository ignore rules. Bounded audit summaries may state derived completion results without embedding the underlying game evidence.
+
+The current source checkpoint and its strictly bounded authority statement are documented in `docs/authoritative-reverse-checkpoint-20260831.md`. Raw and decoded game-derived evidence remains local; the repository contains only derivation code, schemas, tests, and audit summaries needed to explain the provenance boundary.
 
 ## Repository layout
 
