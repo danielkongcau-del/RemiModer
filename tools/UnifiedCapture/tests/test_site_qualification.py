@@ -28,10 +28,17 @@ class SiteQualificationTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "overlap"):
             validate_site_qualification(value)
 
-    def test_partial_safety_claim_rejected(self):
-        value = fixture();value["sites"][0]["safe_redirect_spans"] = [5]
-        with self.assertRaisesRegex(ValueError, "exactly"):
-            validate_site_qualification(value)
+    def test_near_only_safety_claim_is_explicit_and_bounded(self):
+        value = fixture();value["sites"][0].update(
+            safe_redirect_spans=[5], semantic_safe_span=6)
+        self.assertEqual(validate_site_qualification(value)["sites"], 1)
+
+    def test_empty_or_uncovered_safety_claim_rejected(self):
+        for spans, safe in (([], 16), ([16], 6), ([5, 7], 16)):
+            value = fixture();value["sites"][0].update(
+                safe_redirect_spans=spans, semantic_safe_span=safe)
+            with self.subTest(spans=spans), self.assertRaisesRegex(ValueError, "covered subset"):
+                validate_site_qualification(value)
 
 
 if __name__ == "__main__":

@@ -55,3 +55,17 @@ def test_logical_owner_requires_matching_audited_callsite(tmp_path: Path) -> Non
                  _write(tmp_path / "f.json", frontier), tmp_path / "out")
     assert result["logical_runtime_edges"] == []
     assert result["checks"]["invalid_static_join_count"] == 1
+
+
+def test_retained_caller_without_pdata_owner_is_preserved_as_unresolved(tmp_path: Path) -> None:
+    acceptance = {"accepted": True, "points": [{"point": "Game.0x2000/entry",
+        "function_id": "Game.0x2000", "runtime_caller_evidence": [{
+            "callsite_status": "UNRESOLVED", "return_address": 0x123456,
+            "observation_count": 9, "first_qpc": 1, "last_qpc": 2}]}]}
+    manifest = {"functions": [{"function_id": "Game.0x2000", "entry_rva": 0x2000}]}
+    frontier = {"functions": {}, "directEdges": [], "indirectSites": []}
+    result = run(_write(tmp_path / "a.json", acceptance), _write(tmp_path / "m.json", manifest),
+                 _write(tmp_path / "f.json", frontier), tmp_path / "out")
+    assert result["logical_runtime_edges"] == []
+    assert result["checks"]["unresolved_caller_evidence_count"] == 1
+    assert result["unresolved_caller_evidence"][0]["evidence"]["return_address"] == 0x123456

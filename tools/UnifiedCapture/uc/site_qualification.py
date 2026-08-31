@@ -42,11 +42,13 @@ def validate_site_qualification(value: Any) -> dict:
         except ValueError as error:
             raise ValueError(f"{sid}: invalid source prefix") from error
         safe = uint(site.get("semantic_safe_span"), f"{sid}.semantic_safe_span", len(prefix)//2)
-        if safe < 16 or safe > len(prefix)//2:
+        if safe < 5 or safe > len(prefix)//2:
             raise ValueError(f"{sid}: semantic safe span")
         spans = site.get("safe_redirect_spans")
-        if not isinstance(spans, list) or sorted(spans) != [5, 16]:
-            raise ValueError(f"{sid}: safe redirect spans must be exactly [5,16]")
+        if (not isinstance(spans, list) or not spans or len(spans) != len(set(spans))
+                or any(span not in (5, 16) for span in spans)
+                or max(spans) > safe):
+            raise ValueError(f"{sid}: safe redirect spans must be a covered subset of [5,16]")
         if site.get("direct_interior_edge_free") is not True:
             raise ValueError(f"{sid}: direct interior edge freedom required")
         for module, begin, end in ranges:

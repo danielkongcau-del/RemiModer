@@ -14,6 +14,7 @@ from collections import defaultdict
 from pathlib import Path
 from typing import Any
 
+from uc.cli import run_main
 from uc.model import canonical, file_hash
 
 
@@ -91,12 +92,20 @@ def run(acceptance_path: Path, manifest_path: Path, frontier_path: Path,
     edge_groups: dict[tuple[str, str], dict[str, Any]] = {}
     external_groups: dict[tuple[str, str], dict[str, Any]] = {}
     caller_rows = []
+    unresolved_caller_evidence = []
     invalid_static_joins = []
     for point in acceptance["points"]:
         callee_point = point["point"]
         callee_rva = manifest_entries[point["function_id"]]
         for evidence in point.get("runtime_caller_evidence", []):
-            runtime_function = evidence["caller_runtime_function"]
+            runtime_function = evidence.get("caller_runtime_function")
+            if not isinstance(runtime_function, dict):
+                unresolved_caller_evidence.append({
+                    "callee_point": callee_point,
+                    "reason": "caller_runtime_function_absent",
+                    "evidence": evidence,
+                })
+                continue
             begin = int(runtime_function["begin_rva"])
             callsite = int(evidence["callsite_rva"])
             fragment = fragments.get(begin)
@@ -169,10 +178,22 @@ def run(acceptance_path: Path, manifest_path: Path, frontier_path: Path,
         "logical_runtime_edges": logical_edges,
         "catalog_anchored_runtime_edges": external_edges,
         "caller_evidence": caller_rows,
+        "unresolved_caller_evidence": unresolved_caller_evidence,
         "checks": {
             "logical_edge_count": len(logical_edges),
             "catalog_anchored_edge_count": len(external_edges),
+            "caller_evidence_count": len(caller_rows),
+            "pdata_owned_caller_evidence_count": sum(
+                isinstance(row.get("caller_runtime_function"), dict) for row in caller_rows),
+            "static_matched_caller_evidence_count": sum(
+                row.get("static_match") is True for row in caller_rows),
+            "catalog_matched_caller_evidence_count": sum(
+                bool(row.get("catalog_matches")) for row in caller_rows),
+            "unmatched_caller_evidence_count": sum(
+                not row.get("static_match") and not row.get("catalog_matches")
+                for row in caller_rows),
             "invalid_static_join_count": len(invalid_static_joins),
+            "unresolved_caller_evidence_count": len(unresolved_caller_evidence),
             "all_logical_edges_static_verified": not invalid_static_joins,
         },
         "invalid_static_joins": invalid_static_joins,
@@ -205,6 +226,7 @@ if __name__ == "__main__":
     parser.add_argument("--native-consumers", type=Path)
     parser.add_argument("--out", type=Path, required=True)
     args = parser.parse_args()
-    run(args.acceptance.resolve(), args.manifest.resolve(), args.frontier.resolve(), args.out.resolve(),
-        args.engine_dispatch.resolve() if args.engine_dispatch else None,
-        args.native_consumers.resolve() if args.native_consumers else None)
+    run_main(run, args.acceptance.resolve(), args.manifest.resolve(), args.frontier.resolve(),
+             args.out.resolve(),
+             args.engine_dispatch.resolve() if args.engine_dispatch else None,
+             args.native_consumers.resolve() if args.native_consumers else None)

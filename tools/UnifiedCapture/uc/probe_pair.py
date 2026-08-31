@@ -459,7 +459,19 @@ def compile_probe_pair(plan: dict, *, verify_sources: bool = True) -> CompiledPr
                           "patch": entry_patch_hash,
                           "subscription": LogicalSubscription(oid, "entry", "", None)})
 
-        manifest_ref = observation.get("native_exit_manifest", {})
+        completion = observation.get("completion")
+        manifest_ref = observation.get("native_exit_manifest")
+        if manifest_ref is None:
+            if requirement != "none":
+                raise ValueError(f"{oid}: exit capture requires a native exit manifest")
+            if completion is not None:
+                raise ValueError(f"{oid}: entry-only instruction observation cannot declare completion sites")
+            function_id = observation.get("instruction_site_id", oid)
+            if not isinstance(function_id, str) or not function_id:
+                raise ValueError(f"{oid}: instruction_site_id")
+            site_rows[-1]["subscription"] = LogicalSubscription(
+                oid, "instruction", function_id, None)
+            continue
         manifest_path = Path(manifest_ref.get("path", ""))
         if file_hash(manifest_path) != sha(manifest_ref.get("sha256")):
             raise ValueError(f"{oid}: native exit manifest changed")
@@ -473,7 +485,6 @@ def compile_probe_pair(plan: dict, *, verify_sources: bool = True) -> CompiledPr
         if function.get("module") != module or function.get("entry_rva") != entry_rva:
             raise ValueError(f"{oid}: entry does not match native exit manifest")
         site_rows[-1]["subscription"] = LogicalSubscription(oid, "entry", function_id, None)
-        completion = observation.get("completion")
         if requirement == "none":
             if completion is not None:
                 raise ValueError(f"{oid}: entry-only observation cannot declare completion sites")

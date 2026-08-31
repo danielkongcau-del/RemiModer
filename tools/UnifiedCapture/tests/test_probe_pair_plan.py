@@ -88,7 +88,21 @@ class ProbePairPlanTests(unittest.TestCase):
     def test_entry_only_does_not_activate_exit(self):
         compiled = compile_probe_pair(self.make_plan(requirement="none"))
         self.assertEqual(len(compiled.sites), 1)
-        self.assertEqual(compiled.sites[0].subscriptions[0].role, "entry")
+
+    def test_entry_only_instruction_site_does_not_require_function_manifest(self):
+        value = self.make_plan(requirement="none")
+        observation = value["observations"][0]
+        observation.pop("native_exit_manifest")
+        observation["instruction_site_id"] = "raw-callsite-100"
+        compiled = compile_probe_pair(value)
+        self.assertEqual(len(compiled.sites), 1)
+        self.assertEqual(compiled.sites[0].subscriptions[0].role, "instruction")
+
+    def test_exit_capture_still_requires_function_manifest(self):
+        value = self.make_plan(requirement="completion")
+        value["observations"][0].pop("native_exit_manifest")
+        with self.assertRaisesRegex(ValueError, "requires a native exit manifest"):
+            compile_probe_pair(value)
 
     def test_return_address_retention_is_explicit_bounded_and_entry_only(self):
         value = self.make_plan(requirement="none")

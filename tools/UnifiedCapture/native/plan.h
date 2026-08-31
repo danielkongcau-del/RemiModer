@@ -114,7 +114,12 @@ struct Point {
     std::atomic<uint64_t> callbacksObserved{0},recordsCaptured{0},recordsStoreAttempted{0},recordsEncoded{0};
     std::atomic<uint32_t> poolHighWater{0};
     // Deliberate predicate filtering is accounted independently from loss.
-    std::atomic<uint64_t> filtered{0};
+    std::atomic<uint64_t> filtered{0},earlyFiltered{0};
+    // A raw-register entry predicate can be evaluated before record-pool
+    // acquisition, XMM copying, return-address reads, and pairing work.  The
+    // normal Capture path evaluates it again for admitted records so the raw
+    // evidence format and predicate semantics remain unchanged.
+    uint32_t earlyPredicateIndex=UINT32_MAX;
     // Per-plan evidence retention. GPRs are copied at callback entry; XMM is
     // copied only when this logical point retains a full record.
     bool captureXmm=true;
@@ -163,4 +168,6 @@ std::shared_ptr<Generation> Compile(const Json&,const std::function<uint64_t(uin
 // Returns false when an entry-phase predicate filtered the event; the caller
 // must release the cell/payload without recording and count it as filtered.
 bool Capture(Point&,Record&,const Abi&,const Abi&,uint32_t phase) noexcept;
+// Returns true only for a conclusive raw-register predicate mismatch.
+bool RejectByEarlyPredicate(Point&,const Abi&) noexcept;
 }

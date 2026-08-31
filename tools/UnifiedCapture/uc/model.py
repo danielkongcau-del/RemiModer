@@ -188,6 +188,31 @@ def validate(plan: dict, *, verify_sources=False) -> dict:
                     raise ValueError("read dependency unavailable at selected phase")
             total += size
             available[rid] = read
+        runtime_predicates = point.get("runtime_predicates", [])
+        if not isinstance(runtime_predicates, list) or len(runtime_predicates) > 16:
+            raise ValueError("runtime_predicates must contain at most 16 rows")
+        bound_reads = set()
+        for binding in runtime_predicates:
+            if not isinstance(binding, dict):
+                raise ValueError("runtime predicate row")
+            read_id = binding.get("read_id")
+            if read_id not in available or read_id in bound_reads:
+                raise ValueError("runtime predicate needs one unique existing read")
+            bound_reads.add(read_id)
+            read = available[read_id]
+            if read.get("when") is not None:
+                raise ValueError("runtime predicate cannot replace an existing predicate")
+            if read.get("op", "scalar") not in ("scalar", "relative", "register") or \
+                    read.get("phase", "both") != "enter":
+                raise ValueError("runtime predicate needs an enter-phase scalar read")
+            if binding.get("op") not in ("eq", "neq"):
+                raise ValueError("runtime predicate op must be eq/neq")
+            if binding.get("module") not in modules:
+                raise ValueError("runtime predicate module")
+            uint(binding.get("rva"), "runtime predicate rva")
+            refs = binding.get("evidence", [])
+            if not refs or any(ref not in sources for ref in refs):
+                raise ValueError("runtime predicate lacks existing evidence")
         retention = point.get("retention")
         if retention is not None:
             mode = retention.get("mode") if isinstance(retention, dict) else None
@@ -239,6 +264,8 @@ def validate(plan: dict, *, verify_sources=False) -> dict:
                     raise ValueError("exact caller lacks existing evidence")
             if any("when" in read for read in point.get("reads", [])):
                 raise ValueError("return-address retention cannot be combined with read predicates")
+            if runtime_predicates:
+                raise ValueError("return-address retention cannot be combined with runtime predicates")
         if total > resources["max_record_bytes"]:
             raise ValueError("read program exceeds declared record byte budget")
     return {"plan_hash": digest(plan), "points": len(points), "source_count": len(sources),

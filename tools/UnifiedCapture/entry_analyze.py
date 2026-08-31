@@ -90,6 +90,27 @@ def _annotate_observed_caller(resolved, binding, bindings_by_point):
         resolved["caller_runtime_function_observed_points"] = owners
 
 
+def _caller_module(return_address: int, module_bindings: dict[str, dict[str, Any]],
+                   module_images: dict[str, NativePE]) -> tuple[str, dict[str, Any], NativePE] | None:
+    """Resolve a caller address against every bound module, not the callee module.
+
+    A retained entry return address belongs to the caller.  Cross-module calls
+    are expected, so resolving it against only the observed point's module
+    falsely labels valid UnityPlayer callers of GameAssembly entries as out of
+    range.
+    """
+    matches = []
+    for alias, binding in module_bindings.items():
+        image = module_images.get(alias)
+        base = binding.get("module_base")
+        if image is not None and isinstance(base, int) \
+                and base <= return_address < base + image.size_of_image:
+            matches.append((alias, binding, image))
+    if len(matches) > 1:
+        raise ValueError(f"return address belongs to overlapping bound modules: {return_address:#x}")
+    return matches[0] if matches else None
+
+
 def _campaign_unit(run: Path, unit_id: str | None) -> Path:
     units = run / "units"
     if not units.is_dir():
@@ -196,6 +217,13 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None,
     process_binding = plan.get("process_binding", {})
     bindings = [binding for row in activation_rows for binding in row.get("bindings", [])]
     bindings_by_point = {binding.get("point"): binding for binding in bindings}
+    module_bindings: dict[str, dict[str, Any]] = {}
+    for binding in bindings:
+        alias = binding.get("module")
+        prior = module_bindings.get(alias)
+        if prior is not None and prior.get("module_base") != binding.get("module_base"):
+            raise ValueError(f"module base changed inside activation: {alias}")
+        module_bindings[alias] = binding
     module_images: dict[str, NativePE] = {}
     for module_alias, module in plan.get("modules", {}).items():
         source = next((row for row in plan.get("sources", {}).values()
@@ -213,6 +241,8 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None,
             "raw_activation_seen": False, "raw_activation_complete": True,
             "raw_window_seen": False, "raw_window_complete": True,
             "caller_by_return": {}, "retention_sample_keys": set(), "retention_aggregate_seen": set(),
+            "retention_lane_seen": {}, "retention_lane_complete": {},
+            "retention_lane_sample_keys": {}, "retention_lane_read_failure_events": {},
         }
     retention_by_point = {
         row.get("point"): row for row in retention_rows if row.get("generation") == generation
@@ -249,13 +279,20 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None,
             if retention_policy:
                 retention_key = event.get("retention_key", {})
                 identity = _retention_identity(retention_key)
+                lane = retention_key.get("lane", "unknown")
+                state["retention_lane_seen"][lane] = True
+                state["retention_lane_complete"][lane] = (
+                    state["retention_lane_complete"].get(lane, True) and raw_ok)
+                if event.get("read_failures", 0):
+                    state["retention_lane_read_failure_events"][lane] = (
+                        state["retention_lane_read_failure_events"].get(lane, 0) + 1)
                 if identity is not None:
                     state["retention_sample_keys"].add(identity)
+                    state["retention_lane_sample_keys"].setdefault(lane, set()).add(identity)
             if not (raw_ok and (retention_policy or in_window)):
                 continue
-            binding = bindings_by_point.get(point)
-            image = module_images.get(binding.get("module")) if binding else None
-            if binding is None or image is None:
+            callee_binding = bindings_by_point.get(point)
+            if callee_binding is None:
                 continue
             observed = _retained_return_address(event) if retention_policy else entry_return_address(event, blob)
             if observed is None:
@@ -275,14 +312,23 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None,
                     prior["first_qpc"] = min(prior["first_qpc"], event["qpc"])
                     prior["last_qpc"] = max(prior["last_qpc"], event["qpc"])
                 continue
-            resolved = resolve_callsite(observed, binding, image)
-            resolved["module"] = binding.get("module")
+            caller = _caller_module(observed["return_address"], module_bindings, module_images)
+            if caller is None:
+                resolved = dict(observed)
+                resolved["module_membership"] = "OUTSIDE_ALL_BOUND_MODULES"
+                resolved["callsite_status"] = "UNRESOLVED"
+                resolved["module"] = None
+            else:
+                caller_alias, caller_binding, caller_image = caller
+                resolved = resolve_callsite(observed, caller_binding, caller_image)
+                resolved["module"] = caller_alias
             resolved["representative_event_id"] = event["event_id"]
             resolved["observation_count"] = aggregate["count"] if aggregate else 1
             resolved["first_qpc"] = aggregate["first_qpc"] if aggregate else event["qpc"]
             resolved["last_qpc"] = aggregate["last_qpc"] if aggregate else event["qpc"]
-            _annotate_observed_target(resolved, binding, bindings_by_point)
-            _annotate_observed_caller(resolved, binding, bindings_by_point)
+            if caller is not None:
+                _annotate_observed_target(resolved, caller_binding, bindings_by_point)
+                _annotate_observed_caller(resolved, caller_binding, bindings_by_point)
             state["caller_by_return"][return_address] = resolved
             if aggregate_identity is not None:
                 state["retention_aggregate_seen"].add(aggregate_identity)
@@ -307,23 +353,52 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None,
         point_coverage = [row for row in coverage if row.get("point") == point]
         covered = coverage_contains_window(point_coverage, point, window)
         losses = [row for row in loss_rows if row.get("point") == point and row.get("generation") == generation]
-        lossless = len(losses) == 1 and all(losses[0].get(key) == 0 for key in
+        loss_row = losses[0] if len(losses) == 1 else {}
+        point_wide_lossless = len(losses) == 1 and all(loss_row.get(key) == 0 for key in
             ("events", "bytes", "unknown_byte_records", "read_failures", "truncated")) and all(
-            value.get("occurrences") == 0 for value in losses[0].get("reasons", {}).values())
+            value.get("occurrences") == 0 for value in loss_row.get("reasons", {}).values())
+        # A retained observation with preselected exact callers has two evidence
+        # lanes.  A failed first sample from a supplementary aggregate caller
+        # must remain visible, but it must not invalidate complete raw ABI from
+        # the independently accounted exact-promoted lane.
+        non_read_lossless = len(losses) == 1 and all(loss_row.get(key) == 0 for key in
+            ("events", "bytes", "unknown_byte_records", "truncated")) and all(
+            value.get("occurrences") == 0 for reason, value in loss_row.get("reasons", {}).items()
+            if reason != "read_failure")
         retention_policy = observation.get("retention")
         retention_generation = retention_by_point.get(point)
         required_keys = {_retention_identity(row) for row in (retention_generation or {}).get("keys", [])}
-        raw = ((state["raw_activation_seen"] and state["raw_activation_complete"]
-                and required_keys <= state["retention_sample_keys"])
-               if retention_policy else
-               (state["raw_window_seen"] and state["raw_window_complete"]))
+        exact_caller_policy = bool((retention_policy or {}).get("exact_callers"))
+        if retention_policy and exact_caller_policy:
+            exact_keys = {_retention_identity(row) for row in (retention_generation or {}).get("keys", [])
+                          if row.get("lane") == "exact_promoted"}
+            raw = (state["retention_lane_seen"].get("exact_promoted", False)
+                   and state["retention_lane_complete"].get("exact_promoted", False)
+                   and exact_keys <= state["retention_lane_sample_keys"].get("exact_promoted", set()))
+            lossless = non_read_lossless and not state["retention_lane_read_failure_events"].get(
+                "exact_promoted", 0)
+            selected_callbacks = int((retention_generation or {}).get("exact_promoted_callbacks", 0))
+            lossless_scope = "exact_promoted_lane"
+        elif retention_policy:
+            raw = (state["raw_activation_seen"] and state["raw_activation_complete"]
+                   and required_keys <= state["retention_sample_keys"])
+            lossless = point_wide_lossless
+            selected_callbacks = int((retention_generation or {}).get("callbacks", 0))
+            lossless_scope = "activation_generation"
+        else:
+            raw = state["raw_window_seen"] and state["raw_window_complete"]
+            lossless = point_wide_lossless
+            selected_callbacks = state["window_count"]
+            lossless_scope = "marked_window"
         if not clean_store or window is None or not covered or not lossless or (retention_policy and
                 (retention_generation is None or not retention_generation.get("complete_for_caller_counts"))):
             status = "UNKNOWN"
-        elif retention_policy and retention_generation["callbacks"] and raw:
+        elif retention_policy and selected_callbacks and raw:
             status = "OBSERVED_AGGREGATED_CALLERS"
-        elif retention_policy and retention_generation["callbacks"]:
+        elif retention_policy and selected_callbacks:
             status = "UNKNOWN_RAW_ABI_INCOMPLETE"
+        elif retention_policy:
+            status = "NOT_OBSERVED_IN_COVERED_WINDOW"
         elif state["window_count"] and raw:
             status = "OBSERVED"
         elif state["window_count"]:
@@ -339,7 +414,14 @@ def analyze_run(run: Path, out: Path, ledger_path: Path | None = None,
             "coverage_contains_marked_window": covered,
             "coverage_intervals": [{"begin_qpc": row.get("begin_qpc"), "end_qpc": row.get("end_qpc"),
                                     "complete": row.get("complete")} for row in point_coverage],
-            "lossless": lossless, "raw_abi_complete": raw,
+            "lossless": lossless, "lossless_scope": lossless_scope,
+            "point_wide_lossless": point_wide_lossless,
+            "point_wide_read_failures": loss_row.get("read_failures", 0),
+            "raw_abi_complete": raw,
+            "retention_lane_read_failure_events": state["retention_lane_read_failure_events"],
+            "supplementary_aggregate_raw_abi_complete": (
+                state["retention_lane_complete"].get("aggregate_first_sample")
+                if exact_caller_policy and state["retention_lane_seen"].get("aggregate_first_sample") else None),
             "evidence_scope": "activation_generation" if retention_policy else "marked_window",
             "retention_generation": ({**retention_generation, "scope": "activation_generation",
                 "temporal_event_trace_complete": False} if retention_generation is not None else None),

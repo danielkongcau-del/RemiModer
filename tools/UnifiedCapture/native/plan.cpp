@@ -69,6 +69,15 @@ void CompilePredicate(const Json& read,ReadOp& op){
 
 void AllocatePools(Generation&);
 
+void SelectEarlyPredicate(Point& p){
+    // Raw registers are immutable copies in Abi, so evaluating their predicate
+    // here cannot introduce a second mutable-memory observation or TOCTOU
+    // ambiguity. Matching calls still run the unchanged read program.
+    for(uint32_t i=0;i<p.ops.size();++i){const auto& op=p.ops[i];
+        if(op.phase==1&&op.hasPredicate&&op.base==Base::Register&&op.op==Op::Register){
+            p.earlyPredicateIndex=i;break;}}
+}
+
 void CompileProbeReads(Point& p,const Json& rows,const std::unordered_map<std::string,Module>& modules,
                        uint64_t maxBytes,const std::function<void(const Json&)>& evidence){
     std::unordered_map<std::string,uint32_t> reads;uint64_t phaseBytes[2]{};
@@ -105,6 +114,7 @@ void CompileProbeReads(Point& p,const Json& rows,const std::unordered_map<std::s
         auto& bytes=phaseBytes[op.phase-1];Require(op.size<=maxBytes&&bytes<=maxBytes-op.size,"read program exceeds per-phase budget");bytes+=op.size;
         reads[op.id]=(uint32_t)p.ops.size();p.ops.push_back(op);
     }
+    SelectEarlyPredicate(p);
     p.blobCapacity=(size_t)std::max(phaseBytes[0],phaseBytes[1]);
 }
 
@@ -188,20 +198,24 @@ std::shared_ptr<Generation> CompileV2(const Json& source){
         p->address=Add(module.base,rva);p->original=p->address;p->moduleBase=module.base;p->backend=Backend::GumProbe;p->prefix=Unhex(entry.at("expected_prefix"));
         Require(p->prefix.size()>=16&&rva<module.size&&p->prefix.size()<=module.size-rva,"v2 entry outside module/source span");
         p->requiredRedirectSpan=RequirePatchContract(entry.at("backend_patch_contract"),p->prefix);
-        p->logicalIdentity=logical++;p->numericId=(uint32_t)p->logicalIdentity;p->functionId=observation.at("native_exit_manifest").at("function_id");p->exitRequirement=observation.at("exit_capture_requirement");
+        p->logicalIdentity=logical++;p->numericId=(uint32_t)p->logicalIdentity;p->exitRequirement=observation.at("exit_capture_requirement");
         Require(p->exitRequirement=="none"||p->exitRequirement=="completion"||p->exitRequirement=="return_value"||p->exitRequirement=="path_identity","exit requirement");
         p->mode=p->exitRequirement=="none"?PointMode::Single:PointMode::ProbePair;
+        if(observation.contains("native_exit_manifest"))p->functionId=observation.at("native_exit_manifest").at("function_id");
+        else {Require(p->mode==PointMode::Single,"exit capture requires a native exit manifest");
+            p->functionId=observation.value("instruction_site_id",p->id);Require(!p->functionId.empty(),"instruction site id");}
         CompileProbeReads(*p,entry.value("reads",Json::array()),modules,maxBytes,evidence);
         if(p->mode==PointMode::Single)for(const auto& op:p->ops)Require(op.phase==1,"leave read requires an exit capture requirement");
         CompileRetention(*p,observation,modules,evidence);
-        const auto& manifestRef=observation.at("native_exit_manifest");auto manifestPath=Utf8(manifestRef.at("path").get<std::string>());
-        Require(FileSha(manifestPath)==manifestRef.at("sha256").get<std::string>(),"native exit manifest hash mismatch");auto manifest=Json::parse(ReadFile(manifestPath));
-        Require(manifest.at("schema")=="uc.native-exit-manifest.v1"&&
-            (manifest.at("status")=="three-way-verified"||manifest.at("status")=="partially-verified"),"native exit manifest status");
-        const Json* function=nullptr;for(const auto& row:manifest.at("functions"))if(row.at("function_id").get<std::string>()==p->functionId){Require(function==nullptr,"duplicate function in exit manifest");function=&row;}
-        Require(function,"function missing from exit manifest");Require(function->at("module").get<std::string>()==p->moduleAlias&&U64(function->at("entry_rva"))==rva,"manifest entry mismatch");
-        for(const auto& runtime:function->at("runtime_functions")){auto role=runtime.at("runtime_function_role").get<std::string>();
-            Require(role=="primary"||role=="cold_fragment"||role=="eh_funclet"||role=="thunk"||role=="unknown","runtime function role");}
+        Json manifest;const Json* function=nullptr;
+        if(observation.contains("native_exit_manifest")){const auto& manifestRef=observation.at("native_exit_manifest");auto manifestPath=Utf8(manifestRef.at("path").get<std::string>());
+            Require(FileSha(manifestPath)==manifestRef.at("sha256").get<std::string>(),"native exit manifest hash mismatch");manifest=Json::parse(ReadFile(manifestPath));
+            Require(manifest.at("schema")=="uc.native-exit-manifest.v1"&&
+                (manifest.at("status")=="three-way-verified"||manifest.at("status")=="partially-verified"),"native exit manifest status");
+            for(const auto& row:manifest.at("functions"))if(row.at("function_id").get<std::string>()==p->functionId){Require(function==nullptr,"duplicate function in exit manifest");function=&row;}
+            Require(function,"function missing from exit manifest");Require(function->at("module").get<std::string>()==p->moduleAlias&&U64(function->at("entry_rva"))==rva,"manifest entry mismatch");
+            for(const auto& runtime:function->at("runtime_functions")){auto role=runtime.at("runtime_function_role").get<std::string>();
+                Require(role=="primary"||role=="cold_fragment"||role=="eh_funclet"||role=="thunk"||role=="unknown","runtime function role");}}
         if(p->mode==PointMode::Single)Require(!observation.contains("completion"),"entry-only observation cannot declare completion sites");
         if(p->mode==PointMode::ProbePair&&observation.contains("completion")){
             const auto& completion=observation.at("completion");Require(completion.at("mode")=="caller_continuation","unsupported completion mode");
@@ -225,7 +239,7 @@ std::shared_ptr<Generation> CompileV2(const Json& source){
                 "duplicate caller continuation");
             Require(continuationAddresses==p->exactCallerAddresses,
                 "exact caller gates and continuation sites must match exactly");
-        }else if(p->mode==PointMode::ProbePair){const auto& complete=function->at("completeness");
+        }else if(p->mode==PointMode::ProbePair){Require(function,"probe-pair function manifest missing");const auto& complete=function->at("completeness");
             Require(complete.at("normal_exit_set_complete")==true&&complete.at("cold_fragments_complete")==true,"exit/cold-fragment coverage incomplete");
             for(const auto& exit:function->at("normal_exits")){Require(exit.at("terminal_semantics")=="normal_return"&&exit.at("terminal_semantics_verified")==true,"terminal semantics not verified");
                 const Json* selected=nullptr;uint64_t selectedSpan=UINT64_MAX;
@@ -476,6 +490,7 @@ std::shared_ptr<Generation> Compile(const Json& source,const std::function<uint6
             Require(op.size<=maxBytes&&p->blobCapacity<=maxBytes-op.size,"read program exceeds budget");p->blobCapacity+=(size_t)op.size;
             reads[op.id]=(uint32_t)p->ops.size();p->ops.push_back(op);
         }
+        SelectEarlyPredicate(*p);
         if(item.contains("legacy_reader"))evidence(item.at("legacy_reader"));ConfigureLegacy(*p,item,modules);
         Require(p->blobCapacity<=maxBytes,"frozen reader exceeds record byte budget");
         CompileRetention(*p,item,modules,evidence);
@@ -511,6 +526,21 @@ bool ReadCString(uint64_t address,unsigned char* dst,uint64_t capacity,uint64_t&
     }
     return true;
 }
+}
+bool RejectByEarlyPredicate(Point& point,const Abi& now) noexcept {
+    if(point.earlyPredicateIndex==UINT32_MAX)return false;
+    const auto begin=Clock();const auto& op=point.ops[point.earlyPredicateIndex];uint64_t base=0,value=0;
+    if(op.base!=Base::Register||op.op!=Op::Register||!(now.registerMask&(1U<<op.index)))return false;
+    base=now.regs[op.index];value=base;if(op.size<8)value&=(1ull<<(op.size*8))-1;
+    bool equal=false;for(uint32_t n=0;n<op.predicateCount;++n)
+        equal|=(value&op.predicateMask)==(op.predicateValues[n]&op.predicateMask);
+    if(equal!=op.predicateNegate)return false;
+    const auto end=Clock(),ticks=end-begin;point.filtered.fetch_add(1,std::memory_order_relaxed);
+    point.earlyFiltered.fetch_add(1,std::memory_order_relaxed);
+    point.readSamples.fetch_add(1,std::memory_order_relaxed);point.readTicks.fetch_add(ticks,std::memory_order_relaxed);
+    auto maximum=point.readMax.load(std::memory_order_relaxed);
+    while(ticks>maximum&&!point.readMax.compare_exchange_weak(maximum,ticks,std::memory_order_relaxed)){}
+    return true;
 }
 bool Capture(Point& point,Record& record,const Abi& now,const Abi& entry,uint32_t phase) noexcept {
     record.abi=now;if(!point.captureXmm)record.abi.xmmMask=0;

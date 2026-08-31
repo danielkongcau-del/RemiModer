@@ -47,6 +47,64 @@ def qualified_source_table(source_plan: dict, module_sources: dict,
     return result
 
 
+def qualification_module_bases(response: dict) -> dict[str, int]:
+    """Return one stable base per module from the target qualification.
+
+    The process identity deliberately does not contain module bases.  Those
+    bases belong to this module-load instance and are independently reported
+    by every qualified site.
+    """
+    bases = {}
+    for site in response.get("sites", []):
+        module, base = site.get("module"), site.get("module_base")
+        if not isinstance(module, str) or type(base) is not int or base <= 0:
+            raise ValueError("qualified site lacks a valid module base")
+        prior = bases.setdefault(module, base)
+        if prior != base:
+            raise ValueError(f"{module}: qualification reported inconsistent module bases")
+    return bases
+
+
+def bind_runtime_predicates(source_plan: dict, response: dict) -> tuple[dict, list[dict]]:
+    """Resolve source-declared module+rva predicates for this process only."""
+    result = copy.deepcopy(source_plan)
+    bases = qualification_module_bases(response)
+    rows = []
+    for point in result.get("points", []):
+        reads = {read.get("id"): read for read in point.get("reads", [])}
+        seen = set()
+        for binding in point.pop("runtime_predicates", []):
+            read_id = binding.get("read_id")
+            if read_id not in reads or read_id in seen:
+                raise ValueError(f"{point.get('id')}: runtime predicate read mismatch")
+            seen.add(read_id)
+            read = reads[read_id]
+            if "when" in read:
+                raise ValueError(f"{point.get('id')}:{read_id}: predicate already exists")
+            module = binding.get("module")
+            if module not in bases:
+                raise ValueError(f"{point.get('id')}:{read_id}: module base was not qualified")
+            rva = binding.get("rva")
+            if type(rva) is not int or rva < 0:
+                raise ValueError(f"{point.get('id')}:{read_id}: invalid binding RVA")
+            value = bases[module] + rva
+            if value > (1 << 64) - 1:
+                raise ValueError(f"{point.get('id')}:{read_id}: bound value overflow")
+            op = binding.get("op")
+            if op not in ("eq", "neq"):
+                raise ValueError(f"{point.get('id')}:{read_id}: unsupported binding op")
+            read["when"] = {"op": op, "value": value}
+            read["evidence"] = list(dict.fromkeys([
+                *read.get("evidence", []), *binding.get("evidence", []),
+                "runtime-predicate-bindings",
+            ]))
+            rows.append({"point": point["id"], "read_id": read_id, "op": op,
+                         "module": module, "module_base": bases[module], "rva": rva,
+                         "resolved_value": value,
+                         "source_evidence": list(binding.get("evidence", []))})
+    return result, rows
+
+
 def derive_entry_qualified_manifest(manifest: dict, evidence_path: Path,
                                     process_identity: dict) -> dict:
     """Promote only the entry side after an in-process patch/restore check.
@@ -107,16 +165,30 @@ def run(manifest_path: Path, plan_path: Path, evidence_path: Path, output: Path,
     if any(identity != process_identities[0] for identity in process_identities[1:]):
         raise ValueError("qualified entry sites belong to different process instances")
     process_identity = process_identities[0]
+    bound_plan, predicate_bindings = bind_runtime_predicates(source_plan, response)
     functions = {row["function_id"]: row for row in manifest["functions"]}
     module_sources = {row["alias"]: row for row in manifest["sources"] if row.get("kind") == "module"}
     source_table = qualified_source_table(source_plan, module_sources, evidence_path)
     output.mkdir(parents=True)
+    if predicate_bindings:
+        binding_path = output / "runtime-predicate-bindings.json"
+        binding_artifact = {
+            "schema": "uc.runtime-predicate-bindings.v1",
+            "process_binding": process_identity,
+            "source_plan": {"path": str(plan_path), "sha256": file_hash(plan_path)},
+            "qualification_evidence": {"path": str(evidence_path), "sha256": file_hash(evidence_path)},
+            "bindings": predicate_bindings,
+        }
+        binding_path.write_bytes(canonical(binding_artifact))
+        source_table["runtime-predicate-bindings"] = {
+            "path": str(binding_path), "sha256": file_hash(binding_path)
+        }
     entry_manifest = derive_entry_qualified_manifest(manifest, evidence_path, process_identity)
     validate_exit_manifest(entry_manifest)
     entry_manifest_path = output / "native-entry-manifest.target-qualified.json"
     entry_manifest_path.write_bytes(canonical(entry_manifest))
     observations = []
-    for point in source_plan["points"]:
+    for point in bound_plan["points"]:
         function = functions[point["id"]]
         result = observed[point["id"] + "/entry"]
         reads = []
@@ -146,8 +218,8 @@ def run(manifest_path: Path, plan_path: Path, evidence_path: Path, output: Path,
         observations.append(observation)
     plan = {"schema": "uc.capture-plan.v2", "plan_id": "target-qualified-" + source_plan["plan_id"],
         "plan_revision": source_plan["plan_revision"], "process_binding": process_identity,
-        "modules": {alias: source_plan["modules"][alias]
-                    for alias in sorted({point["module"] for point in source_plan["points"]})},
+        "modules": {alias: bound_plan["modules"][alias]
+                    for alias in sorted({point["module"] for point in bound_plan["points"]})},
         "sources": source_table,
         "resources": {"event_slots_per_observation": max(256, source_plan.get("resources", {}).get("slots_per_point", 0)),
                       "call_frames_per_function": 8, "thread_nesting_limit": 256,
@@ -169,6 +241,7 @@ def run(manifest_path: Path, plan_path: Path, evidence_path: Path, output: Path,
         "logical_observations": len(observations), "physical_sites": len(compiled.sites),
         "qualification_sites_total": len(observed), "qualification_sites_used": len(expected_ids),
         "qualification_superset_accepted": allow_qualification_superset,
+        "runtime_predicate_bindings": len(predicate_bindings),
         "exit_probes_activated": exit_requirement != "none"}
     (output / "report.json").write_bytes(canonical(report))
     print(json.dumps({"output": str(output), **report}, ensure_ascii=False))

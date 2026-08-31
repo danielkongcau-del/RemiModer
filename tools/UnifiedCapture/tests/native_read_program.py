@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 from pathlib import Path
 import sys
+import time
 import uuid
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -66,13 +67,22 @@ def run():
         host.invoke("pair", add=3)   # entry value == 10: recorded
         host.invoke("pair", add=7)   # entry value == 13: filtered by plan
         host.invoke("pair", add=3)   # entry value == 20: filtered by plan
+        # Hot-path regression: all three observations reject these calls in
+        # the native early predicate gate, before pool/XMM/stack work.
+        stress_begin = time.perf_counter()
+        host.invoke("pair_stress", count=20_000)
+        stress_seconds = time.perf_counter() - stress_begin
+        assert stress_seconds < 5.0, stress_seconds
         running = host.control("status")
         timing = next(row for row in running["read_timing"] if row["point"] == "pair")
-        assert timing["samples"] == 3 and timing["filtered_by_plan"] == 2, timing
+        assert timing["samples"] == 20_003 and timing["filtered_by_plan"] == 20_002, timing
+        assert timing["early_predicate_enabled"] is False and timing["early_filtered_by_plan"] == 0, timing
         register_timing = next(row for row in running["read_timing"] if row["point"] == "pair-register-filter")
-        assert register_timing["samples"] == 3 and register_timing["filtered_by_plan"] == 1, register_timing
+        assert register_timing["samples"] == 20_003 and register_timing["filtered_by_plan"] == 20_001, register_timing
+        assert register_timing["early_predicate_enabled"] is True and register_timing["early_filtered_by_plan"] == 20_001, register_timing
         in_timing = next(row for row in running["read_timing"] if row["point"] == "pair-register-in-filter")
-        assert in_timing["samples"] == 3 and in_timing["filtered_by_plan"] == 2, in_timing
+        assert in_timing["samples"] == 20_003 and in_timing["filtered_by_plan"] == 20_002, in_timing
+        assert in_timing["early_predicate_enabled"] is True and in_timing["early_filtered_by_plan"] == 20_002, in_timing
         stopped = host.stop()
         from native_integration import records
         events = [event for event, _ in records(stopped["directory"])]
@@ -100,10 +110,12 @@ def run():
         metadata, _ = read_manifest(Path(stopped["directory"]) / "session.manifest")
         session_end = next(row for row in reversed(metadata) if row.get("kind") == "session_end")
         filtered = [row for row in session_end["loss"] if row.get("filtered_by_plan")]
-        assert sorted(row["filtered_by_plan"] for row in filtered) == [1, 2, 2], session_end["loss"]
+        assert sorted(row["filtered_by_plan"] for row in filtered) == [20_001, 20_002, 20_002], session_end["loss"]
         assert inspect_session(Path(stopped["directory"]))["storage_complete"]
-        result = {"ok": True, "events": len(events), "filtered_by_plan": 5,
+        result = {"ok": True, "events": len(events), "filtered_by_plan": 60_005,
                   "timed_callback_samples": timing["samples"],
+                  "stress_calls": 20_000, "stress_seconds": stress_seconds,
+                  "stress_calls_per_second": 20_000 / stress_seconds,
                   "string_bytes": by_id["count-string"]["value"],
                   "array_bytes": by_id["window"]["length"],
                   "game_runtime_verified": False}

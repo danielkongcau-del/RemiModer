@@ -9,6 +9,8 @@ import json
 import tempfile
 
 from p1_apply_entry_qualification import (derive_entry_qualified_manifest,
+                                          bind_runtime_predicates,
+                                          qualification_module_bases,
                                           qualified_evidence_refs,
                                           qualified_source_table,
                                           validate_qualification_scope)
@@ -78,6 +80,32 @@ class CampaignQualificationTests(unittest.TestCase):
                 qualified_evidence_refs(["runtime-field-layout"], "game"),
                 ["runtime-field-layout", "game-module", "target-qualification"],
             )
+
+    def test_runtime_predicate_binds_module_rva_after_qualification(self):
+        plan = {"points": [{"id": "invoker", "reads": [{
+            "id": "code-target", "op": "register", "base": "rcx",
+            "phase": "enter", "width": 8, "evidence": ["static-api"],
+        }], "runtime_predicates": [{
+            "read_id": "code-target", "op": "eq", "module": "game",
+            "rva": 0x1234, "evidence": ["static-api"],
+        }]}]}
+        response = {"sites": [
+            {"module": "game", "module_base": 0x180000000},
+            {"module": "game", "module_base": 0x180000000},
+        ]}
+        bound, rows = bind_runtime_predicates(plan, response)
+        read = bound["points"][0]["reads"][0]
+        self.assertEqual(read["when"], {"op": "eq", "value": 0x180001234})
+        self.assertIn("runtime-predicate-bindings", read["evidence"])
+        self.assertNotIn("runtime_predicates", bound["points"][0])
+        self.assertEqual(rows[0]["resolved_value"], 0x180001234)
+
+    def test_runtime_predicate_rejects_inconsistent_module_bases(self):
+        with self.assertRaisesRegex(ValueError, "inconsistent module bases"):
+            qualification_module_bases({"sites": [
+                {"module": "game", "module_base": 0x1000},
+                {"module": "game", "module_base": 0x2000},
+            ]})
 
     def test_merge_verifies_used_sources_and_prunes_retired_unused_rows(self):
         with tempfile.TemporaryDirectory() as directory:

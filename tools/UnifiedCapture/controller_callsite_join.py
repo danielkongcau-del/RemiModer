@@ -33,6 +33,27 @@ def _parse_catalog(path: Path) -> dict[int, list[dict[str, Any]]]:
     return methods
 
 
+def _runtime_callsites(analysis: dict[str, Any]) -> list[dict[str, Any]]:
+    """Normalize legacy caller rows and entry-acceptance v2 evidence."""
+    legacy = analysis.get("runtime_callsites")
+    if isinstance(legacy, list):
+        return legacy
+    rows: list[dict[str, Any]] = []
+    for point in analysis.get("points", []):
+        point_id = point.get("point")
+        for evidence in point.get("runtime_caller_evidence", []):
+            if not isinstance(evidence.get("caller_runtime_function"), dict):
+                continue
+            rows.append({
+                "point": point_id,
+                "callsite_rva": evidence["callsite_rva"],
+                "call_kind": evidence["call_kind"],
+                "event_count": evidence["observation_count"],
+                "caller_runtime_function": evidence["caller_runtime_function"],
+            })
+    return rows
+
+
 def run(analysis_path: Path, catalogs: list[Path], output: Path) -> dict[str, Any]:
     if output.exists():
         raise FileExistsError(f"output is immutable: {output}")
@@ -44,7 +65,7 @@ def run(analysis_path: Path, catalogs: list[Path], output: Path) -> dict[str, An
     rows = []
     groups: dict[tuple[int, str], dict[str, Any]] = {}
     identified = 0
-    for evidence in analysis["runtime_callsites"]:
+    for evidence in _runtime_callsites(analysis):
         begin = int(evidence["caller_runtime_function"]["begin_rva"])
         matches = identities.get(begin, [])
         # Different harvested files can repeat the same authoritative method.
