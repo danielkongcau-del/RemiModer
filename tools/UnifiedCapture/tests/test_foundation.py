@@ -7,6 +7,7 @@ import sqlite3
 import sys
 import tempfile
 import unittest
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -270,6 +271,27 @@ class StoreTests(unittest.TestCase):
         self.assertIsNone(idx.db.execute("SELECT end_evidence FROM instances").fetchone()[0])
         with self.assertRaises(sqlite3.IntegrityError):
             idx.db.execute("INSERT INTO causal_edges VALUES(?,?,?,?)", (ref, ref, ref, "nearby_time"))
+        idx.close()
+
+    def test_index_reuses_one_dictionary_context_for_all_chunks(self):
+        writer = EvidenceWriter(self.path / "session", "one")
+        writer.write([(event(1, 1), b"abc")])
+        writer.write([(event(2, 2), b"def")])
+        writer.close()
+        idx = EvidenceIndex(self.path / "index.db")
+        from uc import index as index_module
+        original = index_module.decode_chunk_file
+        contexts = []
+
+        def observe_context(path, *, dictionary_context=None):
+            contexts.append(dictionary_context)
+            return original(path, dictionary_context=dictionary_context)
+
+        with mock.patch.object(index_module, "decode_chunk_file", side_effect=observe_context):
+            idx.import_session(writer.directory)
+        self.assertEqual(len(contexts), 2)
+        self.assertIsNotNone(contexts[0])
+        self.assertIs(contexts[0], contexts[1])
         idx.close()
 
     def test_index_migrates_pre_reads_schema(self):

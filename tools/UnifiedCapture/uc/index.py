@@ -5,7 +5,7 @@ import json
 from pathlib import Path
 import sqlite3
 from .model import canonical, file_hash
-from .store import decode_chunk_file, inspect_session, read_manifest
+from .store import decode_chunk_file, event_dictionary_context, inspect_session, read_manifest
 
 SCHEMA = """
 PRAGMA foreign_keys=ON;
@@ -93,6 +93,7 @@ class EvidenceIndex:
         directory = Path(directory).resolve()
         inspection = inspect_session(directory)
         records, _ = read_manifest(directory / "session.manifest")
+        dictionary_context = event_dictionary_context(directory / "session.manifest", records)
         header = next((r for r in records if r.get("kind") == "session"), None)
         if header is None:
             raise ValueError("no valid session identity")
@@ -106,7 +107,7 @@ class EvidenceIndex:
         for chunk in inspection["chunks"]:
             path = directory / chunk["file"]
             artifact = self.artifact(path, "uc.chunk.v1")
-            _, events = decode_chunk_file(path)
+            _, events = decode_chunk_file(path, dictionary_context=dictionary_context)
             for offset, length, event, _ in events:
                 self.add_event(artifact, session, offset, length, "decompressed_payload", event)
                 count += 1
