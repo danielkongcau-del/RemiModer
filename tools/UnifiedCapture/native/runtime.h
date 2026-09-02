@@ -1,6 +1,7 @@
 #pragma once
 #include "plan.h"
 #include "store.h"
+#include "d3d11_observer.h"
 #pragma warning(push)
 #pragma warning(disable:4324) // SDK's intentionally aligned GumExceptorScope.
 #include "frida-gum.h"
@@ -42,6 +43,7 @@ class Runtime {
     std::vector<std::unique_ptr<Hook>> hooks;
     std::deque<Json> metadata;
     std::unique_ptr<Store> store;
+    std::unique_ptr<d3d11::Observer> d3d11Observer;
     GumInterceptor* interceptor=nullptr;
     uint64_t generationCounter=0,flushQpc=0,stopQpc=0,markCounter=0;
     std::string storageError;fs::path outputRoot;
@@ -68,6 +70,9 @@ public:
     Json QualifySites(const Json&);
     Json Status()const;
     Json Capabilities()const;
+    void EnableD3D11Observer(Json configuration);
+    bool D3D11ObserverReady()const noexcept;
+    bool D3D11ObserverCaptured()const noexcept;
     void Begin(Hook&,const Abi&,Token&) noexcept;
     void End(Hook&,const Abi&,Token&,bool exceptional=false) noexcept;
     void Probe(Hook&,GumInvocationContext*) noexcept;

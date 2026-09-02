@@ -130,7 +130,8 @@ Json Runtime::Capabilities()const{return {{"schema","uc.capabilities.v1"},{"arch
         {"cfg_cet_policy_query","passed-own-fixture-target-runtime-check-required"},
         {"evidence","tests/native_robustness.py; tests/probe_pair_matrix.py; standalone Gum 17.17.0, Windows x64"},
         {"arbitrary_exception_safety",false}}},
-    {"hook_replace",false},{"mutate_arguments",false},{"module_unload_notification",true},{"module_notifications",ModuleNotificationStatus()},
+    {"hook_replace",false},{"mutate_arguments",false},{"d3d11_startup_observer",true},
+    {"module_unload_notification",true},{"module_notifications",ModuleNotificationStatus()},
     {"unloaded_hook_cleanup_guaranteed",false},{"frozen_readers",LegacyCapabilities()}};}
 void Runtime::Meta(Json j){std::lock_guard lock(metaMutex);metadata.push_back(std::move(j));}
 Bytes Runtime::OriginalPrefix(uint64_t address,size_t size)const{
@@ -682,6 +683,7 @@ void Runtime::ReportRetention(const Generation& gen,Point& p,uint64_t now){
     if(snapshot!=p.lastReportedRetention){store->Meta({{"kind","retention_summary"},{"schema","uc.RetentionSummary.v1"},{"qpc",now},
         {"counting","cumulative-per-point-generation-key"},{"retention",snapshot}});p.lastReportedRetention=std::move(snapshot);}}
 void Runtime::Tick(){
+    if(d3d11Observer)d3d11Observer->Tick();
     bool failedStorage=false;{std::lock_guard errorLock(errorMutex);failedStorage=!storageError.empty();}
     std::lock_guard lock(stateMutex);
     if(clean)return;
@@ -841,6 +843,7 @@ void Runtime::Start(){std::lock_guard lock(stateMutex);Require(!stopRequested.lo
     {std::lock_guard errorLock(errorMutex);Require(storageError.empty(),"storage failed");}Require(!store->SealFailed(),"storage failed");
     Require(active.load()!=nullptr,"apply a plan first");admitting.store(true);}
 Json Runtime::Mark(const std::string& label){
+    Json d3d11Arm=nullptr;if(d3d11Observer)d3d11Arm=d3d11Observer->Arm(label);
     std::vector<std::shared_ptr<Generation>> snapshotGenerations;Json loss,retention,metrics,storageSnapshot;
     uint64_t checkpointId=0,snapshotGeneration=0,snapshotBegin=0;
     {std::lock_guard lock(stateMutex);Require(!clean&&!stopRequested.load()&&!closeInitiated,"session is draining/stopped");
@@ -866,7 +869,7 @@ Json Runtime::Mark(const std::string& label){
     Meta(checkpoint);Meta({{"kind","user_mark"},{"label",label},{"qpc",snapshotEnd},{"checkpoint_id",checkpointId},
         {"native_semantics",false}});FlushMetaDurable();
     return {{"checkpoint_id",checkpointId},{"label",label},{"generation",snapshotGeneration},{"snapshot_begin_qpc",snapshotBegin},
-        {"snapshot_end_qpc",snapshotEnd},{"snapshot_atomic",false}};}
+        {"snapshot_end_qpc",snapshotEnd},{"snapshot_atomic",false},{"d3d11_capture",d3d11Arm}};}
 Json Runtime::Status()const{std::vector<std::shared_ptr<Generation>> snapshotGenerations;
     Json loss,retention,ownership=Json::array(),timing=Json::array(),metrics,storageSnapshot;
     uint64_t snapshotGeneration=0,residentGenerations=0;bool snapshotForced=false,snapshotClean=false,
@@ -894,7 +897,7 @@ Json Runtime::Status()const{std::vector<std::shared_ptr<Generation>> snapshotGen
         for(uint32_t i=0;i<p->poolSize;++i)if(p->pool[i].state.load())++queued;}}
     PROCESS_MEMORY_COUNTERS_EX pm{};pm.cb=sizeof(pm);GetProcessMemoryInfo(GetCurrentProcess(),(PROCESS_MEMORY_COUNTERS*)&pm,sizeof(pm));
     if(persistedError.empty())persistedError=store->SealErrorText();
-    return {{"ok",true},{"state",snapshotForced?"STOPPED_FORCED":snapshotClean?"STOPPED_CLEAN":snapshotStopping?"DRAIN_PENDING":
+    Json result={{"ok",true},{"state",snapshotForced?"STOPPED_FORCED":snapshotClean?"STOPPED_CLEAN":snapshotStopping?"DRAIN_PENDING":
             !persistedError.empty()?"STORAGE_FAILED":snapshotModuleInvalid?"MODULE_REBIND_PENDING":snapshotActive?"RUNNING":"IDLE"},
         {"generation",snapshotGeneration},{"in_flight",calls},{"queued_cells",queued},{"loss",loss},{"retention",retention},{"hooks",ownership},
         {"resident_generations",residentGenerations},{"preallocated_record_bytes",memory},
@@ -904,7 +907,14 @@ Json Runtime::Status()const{std::vector<std::shared_ptr<Generation>> snapshotGen
         {"process_working_set_bytes",pm.WorkingSetSize},{"process_private_bytes",pm.PrivateUsage},{"storage",storageSnapshot},
         {"storage_error",persistedError},{"directory",store->Path()},
         {"session_id",store->Id()},{"automatic_stop",false}};
+    result["d3d11_capture"]=d3d11Observer?d3d11Observer->Status():Json{{"enabled",false}};
+    return result;
 }
+void Runtime::EnableD3D11Observer(Json configuration){std::lock_guard lock(stateMutex);
+    Require(!d3d11Observer,"D3D11 observer already configured");
+    d3d11Observer=std::make_unique<d3d11::Observer>(interceptor,fs::path(observerPath).parent_path(),std::move(configuration));}
+bool Runtime::D3D11ObserverReady()const noexcept{return d3d11Observer&&d3d11Observer->Ready();}
+bool Runtime::D3D11ObserverCaptured()const noexcept{return d3d11Observer&&d3d11Observer->Captured();}
 Json Runtime::RebindPlan()const{std::lock_guard lock(stateMutex);if(!moduleInvalid||stopRequested.load())return nullptr;
     for(auto& g:generations)if(g->inFlight.load())return nullptr;
     for(auto& h:hooks)if(h->owned||h->conflict||h->listener||h->executing.load())return nullptr;

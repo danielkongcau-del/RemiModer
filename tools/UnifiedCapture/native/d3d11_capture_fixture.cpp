@@ -95,10 +95,45 @@ static Json Stage(const char* shader, Json constantBuffers = Json::array()) {
             {"samplers", Json::array()}, {"uavs", Json::array()}};
 }
 
+struct OptionalUnifiedCaptureObserver {
+    HMODULE module = nullptr;
+    BOOL(*captured)() = nullptr;
+    OptionalUnifiedCaptureObserver() {
+        wchar_t path[32768]{};
+        const DWORD size = GetEnvironmentVariableW(L"UC_D3D11_OBSERVER_DLL", path,
+            static_cast<DWORD>(std::size(path)));
+        Require(size < std::size(path), "UC_D3D11_OBSERVER_DLL is too long");
+        if (!size) return;
+        module = LoadLibraryW(path);
+        Require(module != nullptr, "owned fixture could not load UnifiedCapture observer");
+        auto ready = reinterpret_cast<BOOL(*)()>(GetProcAddress(module, "UnifiedCaptureD3D11Ready"));
+        Require(ready != nullptr, "UnifiedCapture observer readiness export is missing");
+        captured = reinterpret_cast<BOOL(*)()>(GetProcAddress(module, "UnifiedCaptureD3D11Captured"));
+        Require(captured != nullptr, "UnifiedCapture observer captured export is missing");
+        const uint64_t deadline = GetTickCount64() + 15000;
+        while (!ready() && GetTickCount64() < deadline) Sleep(10);
+        Require(ready() != FALSE, "UnifiedCapture D3D11 observer did not become ready");
+    }
+    void WaitForCapture() const {
+        if (!captured) return;
+        const uint64_t deadline = GetTickCount64() + 15000;
+        while (!captured() && GetTickCount64() < deadline) Sleep(10);
+        Require(captured() != FALSE, "UnifiedCapture observer did not qualify the owned Draw");
+        // Captured means the callback queued immutable output. Give the
+        // observer worker a bounded chance to perform the out-of-hook write.
+        Sleep(100);
+    }
+    ~OptionalUnifiedCaptureObserver() {
+        // The observer pins itself because callback threads and Gum hooks must
+        // outlive every intercepted D3D object. Process exit owns teardown.
+    }
+};
+
 int wmain(int argc, wchar_t** argv) try {
     Require(argc == 2, "usage: D3D11CaptureFixture.exe <new-package-directory>");
     constexpr unsigned width = 16, height = 16;
     d11::PackageWriter writer(argv[1]);
+    OptionalUnifiedCaptureObserver unifiedCaptureObserver;
 
     D3D_FEATURE_LEVEL level{};
     const D3D_FEATURE_LEVEL requested[] = {D3D_FEATURE_LEVEL_11_0};
@@ -341,6 +376,7 @@ float4 main() : SV_Target0 { return float4(1.0, 0.25, 0.5, 1.0); }
                 {"comparison", {{"mode", "exact_unorm"}}}}})}}})},
     };
     writer.Seal(std::move(manifest));
+    unifiedCaptureObserver.WaitForCapture();
     std::wcout << L"capture=" << (writer.Root() / L"capture.json").c_str() << L"\n";
     return 0;
 } catch (const std::exception& error) {

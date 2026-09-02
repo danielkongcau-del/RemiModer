@@ -193,6 +193,9 @@ DWORD WINAPI Worker(void*){
         try{if(uc::fs::exists(selected)){auto bytes=uc::ReadFile(selected);auto parsedBootstrap=uc::Json::parse(bytes);
             if(parsedBootstrap.value("schema","")=="uc.bootstrap.v1"&&parsedBootstrap.value("mode","")=="control-only"){
                 pendingPlan=nullptr;runtime->Meta({{"kind","bootstrap_control_only"},{"file",selected.string()},{"qpc",uc::Clock()}});}
+            else if(parsedBootstrap.value("schema","")=="uc.bootstrap.v1"&&parsedBootstrap.value("mode","")=="d3d11-capture"){
+                runtime->EnableD3D11Observer(parsedBootstrap.at("d3d11"));pendingPlan=nullptr;
+                runtime->Meta({{"kind","bootstrap_d3d11_capture"},{"file",selected.string()},{"qpc",uc::Clock()}});}
             else pendingPlan=std::move(parsedBootstrap);}}
         catch(const std::exception& e){bootstrapError=e.what();pendingPlan=nullptr;
             runtime->Meta({{"kind","bootstrap_error"},{"error",bootstrapError},{"file",selected.string()},{"qpc",uc::Clock()}});}
@@ -210,5 +213,7 @@ DWORD WINAPI Worker(void*){
         return 1;}
 }
 extern "C" __declspec(dllexport) unsigned UnifiedCaptureProtocolVersion(){return 1;}
+extern "C" __declspec(dllexport) BOOL UnifiedCaptureD3D11Ready(){return runtime&&runtime->D3D11ObserverReady();}
+extern "C" __declspec(dllexport) BOOL UnifiedCaptureD3D11Captured(){return runtime&&runtime->D3D11ObserverCaptured();}
 BOOL WINAPI DllMain(HINSTANCE,DWORD reason,LPVOID){if(reason==DLL_PROCESS_ATTACH){HANDLE thread=CreateThread(nullptr,0,Worker,nullptr,0,nullptr);
     if(!thread)return FALSE;CloseHandle(thread);}return TRUE;}

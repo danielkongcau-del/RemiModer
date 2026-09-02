@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 import hashlib
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -230,6 +231,45 @@ class D3D11CaptureTests(unittest.TestCase):
             self.assertEqual(len(pixels), 16 * 16 * 4)
             self.assertEqual(set(bytes(pixels[index:index + 4]) for index in range(0, len(pixels), 4)),
                              {bytes.fromhex("ff4080ff")})
+
+    def test_startup_observer_automatically_qualifies_owned_draw(self):
+        root = Path(__file__).resolve().parents[1]
+        executable = root / "build" / "D3D11CaptureFixture.exe"
+        observer = Path(os.environ.get("UC_TEST_D3D11_OBSERVER_DLL", root / "build" / "UnifiedCapture.dll"))
+        bootstrap = root / "tests" / "fixtures" / "d3d11_observer_bootstrap.json"
+        if not executable.is_file() or not observer.is_file():
+            self.skipTest("D3D11 fixture and observer DLL have not been built")
+        with tempfile.TemporaryDirectory() as temp:
+            temporary = Path(temp)
+            package_root = temporary / "fixture-package"
+            observer_root = temporary / "observer"
+            observer_root.mkdir()
+            environment = os.environ.copy()
+            environment.update({
+                "UC_BOOTSTRAP": str(bootstrap),
+                "UC_D3D11_CAPTURE_ROOT": str(observer_root),
+                "UC_D3D11_OBSERVER_DLL": str(observer),
+            })
+            completed = subprocess.run([str(executable), str(package_root)], capture_output=True, text=True,
+                                       encoding="utf-8", timeout=30, env=environment)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            catalogs = list(observer_root.glob("draw-catalog-*.json"))
+            self.assertEqual(len(catalogs), 1)
+            catalog = json.loads(catalogs[0].read_text(encoding="utf-8"))
+            self.assertEqual(catalog["draw"], {"call": "Draw", "arguments": {"vertex_count": 3, "start_vertex": 0}})
+            expected = hashlib.sha256((package_root / "artifacts" / "ps.dxbc").read_bytes()).hexdigest()
+            self.assertEqual(catalog["pixel_shader"]["sha256"], expected)
+            self.assertGreaterEqual(catalog["startup_ledger"]["shader_objects"], 2)
+            self.assertGreaterEqual(catalog["startup_ledger"]["input_layout_objects"], 1)
+            pipeline = catalog["pipeline"]
+            self.assertTrue(pipeline["input_assembler"]["input_layout"]["startup_descriptor"])
+            self.assertEqual(pipeline["input_assembler"]["primitive_topology"], 4)
+            self.assertEqual(len(pipeline["input_assembler"]["vertex_buffers"]), 1)
+            self.assertEqual(len(pipeline["stages"]["vs"]["constant_buffers"]), 1)
+            self.assertEqual(pipeline["stages"]["ps"]["shader"]["sha256"], expected)
+            self.assertEqual(pipeline["output_merger"]["rtvs"][0]["descriptor"]["decoded"]["format"], 28)
+            self.assertEqual(pipeline["output_merger"]["rtvs"][0]["resource"]["descriptor"]["decoded"]["width"], 16)
+            self.assertTrue(pipeline["rasterizer"]["state"]["descriptor"]["raw_hex"])
 
 
 if __name__ == "__main__":

@@ -1,0 +1,7 @@
+{
+  "schema": "uc.bootstrap.v1",
+  "mode": "d3d11-capture",
+  "d3d11": {
+    "arm_at_start": true
+  }
+}

@@ -14,9 +14,10 @@ set "UC_INC=/Ivendor /Ivendor\gum-17.17.0 /Inative"
 set "UC_RENDERDOC_INC="
 if exist "%ProgramFiles%\RenderDoc\renderdoc_app.h" set UC_RENDERDOC_INC=/I"%ProgramFiles%\RenderDoc"
 set "UC_COMMON=native\common.cpp native\modules.cpp"
+if not defined UC_AGENT_BASENAME set "UC_AGENT_BASENAME=UnifiedCapture"
 ml64 /nologo /c /Fo build\pair_runtime_fixture.obj native\pair_runtime_fixture.asm
 if errorlevel 1 exit /b 1
-cl /nologo /std:c++20 /utf-8 /O2 /W4 /MT /EHsc /DGUM_STATIC %UC_INC% /LD %UC_COMMON% native\store.cpp native\plan.cpp native\readers.cpp native\runtime.cpp native\legacy.cpp native\agent.cpp /Fo:build\ /Fe:build\UnifiedCapture.dll /link /INCREMENTAL:NO /LIBPATH:vendor\gum-17.17.0 frida-gum.lib Bcrypt.lib Cabinet.lib Psapi.lib Dnsapi.lib Iphlpapi.lib Winmm.lib Ws2_32.lib Shlwapi.lib Advapi32.lib Ole32.lib Shell32.lib User32.lib
+cl /nologo /std:c++20 /utf-8 /O2 /W4 /MT /EHsc /DGUM_STATIC %UC_INC% /LD %UC_COMMON% native\store.cpp native\plan.cpp native\readers.cpp native\runtime.cpp native\legacy.cpp native\d3d11_package.cpp native\d3d11_observer.cpp native\agent.cpp /Fo:build\ /Fe:build\%UC_AGENT_BASENAME%.dll /link /INCREMENTAL:NO /LIBPATH:vendor\gum-17.17.0 frida-gum.lib Bcrypt.lib Cabinet.lib Psapi.lib Dnsapi.lib Iphlpapi.lib Winmm.lib Ws2_32.lib Shlwapi.lib Advapi32.lib Ole32.lib Shell32.lib User32.lib D3D11.lib DXGI.lib D3DCompiler.lib
 if errorlevel 1 exit /b 1
 cl /nologo /std:c++20 /utf-8 /O2 /W4 /MT /EHsc %UC_INC% native\fixture.cpp build\pair_runtime_fixture.obj %UC_COMMON% /Fo:build\ /Fe:build\FixtureHost.exe /link /INCREMENTAL:NO Bcrypt.lib Cabinet.lib Psapi.lib
 if errorlevel 1 exit /b 1
