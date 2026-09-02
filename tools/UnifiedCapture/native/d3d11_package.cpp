@@ -44,7 +44,10 @@ Json DxgiFormat(DXGI_FORMAT value) {
     case DXGI_FORMAT_R8G8B8A8_UNORM: name = "DXGI_FORMAT_R8G8B8A8_UNORM"; break;
     case DXGI_FORMAT_R16_UINT: name = "DXGI_FORMAT_R16_UINT"; break;
     case DXGI_FORMAT_R32_UINT: name = "DXGI_FORMAT_R32_UINT"; break;
-    default: throw std::runtime_error("fixture uses an unmapped DXGI format");
+    default: {
+        const std::string fallback = "DXGI_FORMAT_VALUE_" + std::to_string(static_cast<unsigned>(value));
+        return {{"value", static_cast<unsigned>(value)}, {"name", fallback}};
+    }
     }
     return {{"value", static_cast<unsigned>(value)}, {"name", name}};
 }

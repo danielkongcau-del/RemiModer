@@ -270,6 +270,20 @@ class D3D11CaptureTests(unittest.TestCase):
             self.assertEqual(pipeline["output_merger"]["rtvs"][0]["descriptor"]["decoded"]["format"], 28)
             self.assertEqual(pipeline["output_merger"]["rtvs"][0]["resource"]["descriptor"]["decoded"]["width"], 16)
             self.assertTrue(pipeline["rasterizer"]["state"]["descriptor"]["raw_hex"])
+            self.assertEqual(catalog["status"], "pipeline-and-lossless-resource-snapshots-captured")
+            snapshots = catalog["resource_snapshots"]
+            self.assertEqual({row["phase"] for row in snapshots}, {"before-input", "before-output", "after-output"})
+            for snapshot in snapshots:
+                for subresource in snapshot["subresources"]:
+                    payload = (observer_root / subresource["path"]).read_bytes()
+                    self.assertEqual(len(payload), subresource["size_bytes"])
+                    self.assertEqual(hashlib.sha256(payload).hexdigest(), subresource["sha256"])
+            after = next(row for row in snapshots if row["phase"] == "after-output")
+            after_bytes = (observer_root / after["subresources"][0]["path"]).read_bytes()
+            expected_pixels = (package_root / "reference" / "gbuffer0.bin").read_bytes()
+            row_pitch = after["subresources"][0]["row_pitch"]
+            tight = b"".join(after_bytes[row * row_pitch:row * row_pitch + 16 * 4] for row in range(16))
+            self.assertEqual(tight, expected_pixels)
 
 
 if __name__ == "__main__":

@@ -46,6 +46,7 @@ enum class Kind {
 
 struct Invocation {
     std::array<void*, 12> arguments{};
+    void* captureJob = nullptr;
 };
 
 const char* KindName(Kind kind) noexcept {
@@ -143,7 +144,19 @@ struct Observer::Impl {
     };
     struct LayoutRecord {
         std::string signatureSha256;
+        Bytes signature;
         std::vector<LayoutElement> elements;
+    };
+    struct PendingOutput {
+        fs::path relative;
+        Bytes bytes;
+    };
+    struct CaptureJob {
+        Json catalog;
+        std::vector<PendingOutput> outputs;
+        std::vector<ComPtr<ID3D11Resource>> outputResources;
+        ComPtr<ID3D11DeviceContext> context;
+        std::string suffix;
     };
 
     GumInterceptor* interceptor = nullptr;
@@ -159,9 +172,11 @@ struct Observer::Impl {
     std::unordered_set<void*> contexts;
     std::unordered_set<void*> swapchains;
     std::deque<Json> pendingFiles;
+    std::deque<PendingOutput> pendingOutputs;
     std::atomic<bool> exportHooksReady{false};
     std::atomic<bool> armed{false};
     std::atomic<bool> captured{false};
+    std::atomic<uint64_t> capturesReserved{0};
     std::atomic<uint64_t> frames{0};
     std::atomic<uint64_t> drawsObserved{0};
     std::atomic<uint64_t> matchingDraws{0};
@@ -169,8 +184,11 @@ struct Observer::Impl {
     std::atomic<uint64_t> layoutsObserved{0};
     std::string armLabel;
     std::string requiredPsSha256;
-    uint64_t armCounter = 0;
+    std::string requiredVsSha256;
+    std::atomic<uint64_t> armCounter{0};
     bool armAtStart = false;
+    bool catalogOnly = false;
+    uint64_t maxCaptures = 1;
     std::string error;
 
     Impl(GumInterceptor* gum, fs::path directory, Json config)
@@ -184,8 +202,14 @@ struct Observer::Impl {
             ? fs::path(Utf8(configuration.at("output_root").get<std::string>()))
             : observerDirectory / L"d3d11-captures";
         requiredPsSha256 = configuration.value("pixel_shader_sha256", "");
+        requiredVsSha256 = configuration.value("vertex_shader_sha256", "");
         std::transform(requiredPsSha256.begin(), requiredPsSha256.end(), requiredPsSha256.begin(),
             [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        std::transform(requiredVsSha256.begin(), requiredVsSha256.end(), requiredVsSha256.begin(),
+            [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+        catalogOnly = configuration.value("catalog_only", false);
+        maxCaptures = configuration.value("max_captures", 1ULL);
+        Require(maxCaptures > 0 && maxCaptures <= 256, "D3D11 max_captures must be within 1..256");
         armAtStart = configuration.value("arm_at_start", false);
         armed.store(armAtStart, std::memory_order_release);
         if (armAtStart) armLabel = "bootstrap";
@@ -299,9 +323,10 @@ struct Observer::Impl {
         auto* invocation = static_cast<Invocation*>(
             gum_invocation_context_get_listener_invocation_data(context, sizeof(Invocation)));
         if (!invocation) return;
+        invocation->captureJob = nullptr;
         for (unsigned index = 0; index < invocation->arguments.size(); ++index)
             invocation->arguments[index] = gum_invocation_context_get_nth_argument(context, index);
-        if (IsDraw(kind)) ObserveDraw(kind, invocation->arguments);
+        if (IsDraw(kind)) invocation->captureJob = ObserveDraw(kind, invocation->arguments);
     }
 
     void Leave(Kind kind, GumInvocationContext* context) {
@@ -319,6 +344,11 @@ struct Observer::Impl {
                 AttachDevice(Output<ID3D11Device>(invocation->arguments[9]),
                     Output<ID3D11DeviceContext>(invocation->arguments[11]));
             }
+            return;
+        }
+        if (IsDraw(kind)) {
+            if (invocation->captureJob) CompleteDraw(std::unique_ptr<CaptureJob>(
+                static_cast<CaptureJob*>(invocation->captureJob)));
             return;
         }
         if (kind == Kind::Present) {
@@ -362,6 +392,7 @@ struct Observer::Impl {
             "input layout signature became unreadable before CreateInputLayout returned");
         LayoutRecord record;
         record.signatureSha256 = Sha(signatureBytes.data(), signatureBytes.size());
+        record.signature = std::move(signatureBytes);
         for (const auto& element : elements) {
             LayoutElement copied;
             copied.semantic = element.SemanticName ? element.SemanticName : "";
@@ -639,15 +670,144 @@ struct Observer::Impl {
         return pipeline;
     }
 
-    void ObserveDraw(Kind kind, const std::array<void*, 12>& arguments) {
+    static bool BlockCompressed(DXGI_FORMAT format) noexcept {
+        return (format >= DXGI_FORMAT_BC1_TYPELESS && format <= DXGI_FORMAT_BC5_SNORM) ||
+            (format >= DXGI_FORMAT_BC6H_TYPELESS && format <= DXGI_FORMAT_BC7_UNORM_SRGB);
+    }
+
+    static UINT MipExtent(UINT value, UINT mip) noexcept { return std::max(1U, value >> mip); }
+
+    Json AddDump(CaptureJob& job, const char* phase, ID3D11Resource* source) {
+        Require(source != nullptr, "D3D11 resource dump source is null");
+        ComPtr<ID3D11Device> device;
+        job.context->GetDevice(&device);
+        D3D11_RESOURCE_DIMENSION dimension{};
+        source->GetType(&dimension);
+        ComPtr<ID3D11Resource> staging;
+        UINT mipLevels = 1, arraySize = 1, width = 1, height = 1, depth = 1;
+        DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+        Json descriptor;
+        if (dimension == D3D11_RESOURCE_DIMENSION_BUFFER) {
+            ComPtr<ID3D11Buffer> typedSource; Require(SUCCEEDED(source->QueryInterface(IID_PPV_ARGS(&typedSource))), "buffer query failed");
+            D3D11_BUFFER_DESC value{}; typedSource->GetDesc(&value); descriptor = BufferDescriptor(value); width = value.ByteWidth;
+            D3D11_BUFFER_DESC copy = value; copy.Usage = D3D11_USAGE_STAGING; copy.BindFlags = 0;
+            copy.CPUAccessFlags = D3D11_CPU_ACCESS_READ; copy.MiscFlags = 0; copy.StructureByteStride = 0;
+            ComPtr<ID3D11Buffer> typedStaging; Require(SUCCEEDED(device->CreateBuffer(&copy, nullptr, &typedStaging)), "buffer staging creation failed");
+            Require(SUCCEEDED(typedStaging.As(&staging)), "buffer staging resource query failed");
+        } else if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D) {
+            ComPtr<ID3D11Texture1D> typedSource; Require(SUCCEEDED(source->QueryInterface(IID_PPV_ARGS(&typedSource))), "texture1d query failed");
+            D3D11_TEXTURE1D_DESC value{}; typedSource->GetDesc(&value); descriptor = RawDescriptor(value);
+            width = value.Width; mipLevels = value.MipLevels; arraySize = value.ArraySize; format = value.Format;
+            D3D11_TEXTURE1D_DESC copy = value; copy.Usage = D3D11_USAGE_STAGING; copy.BindFlags = 0;
+            copy.CPUAccessFlags = D3D11_CPU_ACCESS_READ; copy.MiscFlags = 0;
+            ComPtr<ID3D11Texture1D> typedStaging; Require(SUCCEEDED(device->CreateTexture1D(&copy, nullptr, &typedStaging)), "texture1d staging creation failed");
+            Require(SUCCEEDED(typedStaging.As(&staging)), "texture1d staging resource query failed");
+        } else if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE2D) {
+            ComPtr<ID3D11Texture2D> typedSource; Require(SUCCEEDED(source->QueryInterface(IID_PPV_ARGS(&typedSource))), "texture2d query failed");
+            D3D11_TEXTURE2D_DESC value{}; typedSource->GetDesc(&value); descriptor = Texture2DDescriptor(value);
+            Require(value.SampleDesc.Count == 1, "multisampled resource readback requires explicit resolve semantics");
+            width = value.Width; height = value.Height; mipLevels = value.MipLevels; arraySize = value.ArraySize; format = value.Format;
+            D3D11_TEXTURE2D_DESC copy = value; copy.Usage = D3D11_USAGE_STAGING; copy.BindFlags = 0;
+            copy.CPUAccessFlags = D3D11_CPU_ACCESS_READ; copy.MiscFlags = 0;
+            ComPtr<ID3D11Texture2D> typedStaging; Require(SUCCEEDED(device->CreateTexture2D(&copy, nullptr, &typedStaging)), "texture2d staging creation failed");
+            Require(SUCCEEDED(typedStaging.As(&staging)), "texture2d staging resource query failed");
+        } else if (dimension == D3D11_RESOURCE_DIMENSION_TEXTURE3D) {
+            ComPtr<ID3D11Texture3D> typedSource; Require(SUCCEEDED(source->QueryInterface(IID_PPV_ARGS(&typedSource))), "texture3d query failed");
+            D3D11_TEXTURE3D_DESC value{}; typedSource->GetDesc(&value); descriptor = RawDescriptor(value);
+            width = value.Width; height = value.Height; depth = value.Depth; mipLevels = value.MipLevels; format = value.Format;
+            D3D11_TEXTURE3D_DESC copy = value; copy.Usage = D3D11_USAGE_STAGING; copy.BindFlags = 0;
+            copy.CPUAccessFlags = D3D11_CPU_ACCESS_READ; copy.MiscFlags = 0;
+            ComPtr<ID3D11Texture3D> typedStaging; Require(SUCCEEDED(device->CreateTexture3D(&copy, nullptr, &typedStaging)), "texture3d staging creation failed");
+            Require(SUCCEEDED(typedStaging.As(&staging)), "texture3d staging resource query failed");
+        } else throw std::runtime_error("unsupported D3D11 resource dimension");
+        job.context->CopyResource(staging.Get(), source);
+        Json subresources = Json::array();
+        const UINT count = dimension == D3D11_RESOURCE_DIMENSION_TEXTURE3D ? mipLevels : mipLevels * arraySize;
+        for (UINT subresource = 0; subresource < count; ++subresource) {
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            Require(SUCCEEDED(job.context->Map(staging.Get(), subresource, D3D11_MAP_READ, 0, &mapped)), "staging resource map failed");
+            const UINT mip = subresource % mipLevels;
+            const UINT rows = dimension == D3D11_RESOURCE_DIMENSION_BUFFER || dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D ? 1U :
+                BlockCompressed(format) ? std::max(1U, (MipExtent(height, mip) + 3) / 4) : MipExtent(height, mip);
+            const UINT slices = dimension == D3D11_RESOURCE_DIMENSION_TEXTURE3D ? MipExtent(depth, mip) : 1U;
+            const size_t rowPitch = dimension == D3D11_RESOURCE_DIMENSION_BUFFER ? width : mapped.RowPitch;
+            const size_t depthPitch = dimension == D3D11_RESOURCE_DIMENSION_BUFFER ? width :
+                dimension == D3D11_RESOURCE_DIMENSION_TEXTURE1D ? mapped.RowPitch : mapped.DepthPitch ? mapped.DepthPitch : rowPitch * rows;
+            const size_t byteCount = dimension == D3D11_RESOURCE_DIMENSION_BUFFER ? width : depthPitch * slices;
+            Bytes bytes(byteCount);
+            if (byteCount) std::memcpy(bytes.data(), mapped.pData, byteCount);
+            job.context->Unmap(staging.Get(), subresource);
+            const std::string object = Pointer(source).get<std::string>();
+            std::string portableObject = object; portableObject.erase(std::remove(portableObject.begin(), portableObject.end(), 'x'), portableObject.end());
+            const fs::path relative = fs::path("resources") / (std::string(phase) + "-" + portableObject + "-sub" +
+                std::to_string(subresource) + ".bin");
+            const std::u8string encoded = relative.generic_u8string();
+            const std::string portable(reinterpret_cast<const char*>(encoded.data()), encoded.size());
+            const std::string digest = Sha(bytes.data(), bytes.size());
+            subresources.push_back({{"subresource", subresource}, {"mip", mip}, {"row_pitch", rowPitch},
+                {"depth_pitch", depthPitch}, {"rows", rows}, {"slices", slices}, {"path", portable},
+                {"size_bytes", bytes.size()}, {"sha256", digest}, {"lossless", true}});
+            job.outputs.push_back({relative, std::move(bytes)});
+        }
+        return {{"phase", phase}, {"object", Pointer(source)}, {"dimension", static_cast<unsigned>(dimension)},
+            {"descriptor", std::move(descriptor)}, {"subresources", std::move(subresources)}};
+    }
+
+    void CollectResources(ID3D11DeviceContext* context, std::vector<ComPtr<ID3D11Resource>>& inputs,
+                          std::vector<ComPtr<ID3D11Resource>>& outputs) const {
+        std::unordered_set<ID3D11Resource*> seenInputs, seenOutputs;
+        auto add = [](auto* object, auto& destination, auto& seen) {
+            if (!object) return;
+            ComPtr<ID3D11Resource> resource;
+            if constexpr (std::is_base_of_v<ID3D11Resource, std::remove_pointer_t<decltype(object)>>) {
+                object->QueryInterface(IID_PPV_ARGS(&resource));
+            } else object->GetResource(&resource);
+            if (resource && seen.insert(resource.Get()).second) destination.push_back(resource);
+        };
+        std::array<ID3D11Buffer*, D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT> vertexBuffers{};
+        context->IAGetVertexBuffers(0, static_cast<UINT>(vertexBuffers.size()), vertexBuffers.data(), nullptr, nullptr);
+        for (auto* value : vertexBuffers) { add(value, inputs, seenInputs); if (value) value->Release(); }
+        ID3D11Buffer* index = nullptr; context->IAGetIndexBuffer(&index, nullptr, nullptr);
+        add(index, inputs, seenInputs); if (index) index->Release();
+        auto collectStage = [&](auto getBuffers, auto getSrvs) {
+            std::array<ID3D11Buffer*, D3D11_COMMONSHADER_CONSTANT_BUFFER_API_SLOT_COUNT> buffers{};
+            getBuffers(0, static_cast<UINT>(buffers.size()), buffers.data());
+            for (auto* value : buffers) { add(value, inputs, seenInputs); if (value) value->Release(); }
+            std::array<ID3D11ShaderResourceView*, D3D11_COMMONSHADER_INPUT_RESOURCE_SLOT_COUNT> views{};
+            getSrvs(0, static_cast<UINT>(views.size()), views.data());
+            for (auto* value : views) { add(value, inputs, seenInputs); if (value) value->Release(); }
+        };
+        collectStage([&](auto a, auto b, auto c) { context->VSGetConstantBuffers(a, b, c); },
+            [&](auto a, auto b, auto c) { context->VSGetShaderResources(a, b, c); });
+        collectStage([&](auto a, auto b, auto c) { context->PSGetConstantBuffers(a, b, c); },
+            [&](auto a, auto b, auto c) { context->PSGetShaderResources(a, b, c); });
+        collectStage([&](auto a, auto b, auto c) { context->GSGetConstantBuffers(a, b, c); },
+            [&](auto a, auto b, auto c) { context->GSGetShaderResources(a, b, c); });
+        collectStage([&](auto a, auto b, auto c) { context->HSGetConstantBuffers(a, b, c); },
+            [&](auto a, auto b, auto c) { context->HSGetShaderResources(a, b, c); });
+        collectStage([&](auto a, auto b, auto c) { context->DSGetConstantBuffers(a, b, c); },
+            [&](auto a, auto b, auto c) { context->DSGetShaderResources(a, b, c); });
+        std::array<ID3D11Buffer*, D3D11_SO_BUFFER_SLOT_COUNT> streamOutput{};
+        context->SOGetTargets(static_cast<UINT>(streamOutput.size()), streamOutput.data());
+        for (auto* value : streamOutput) { add(value, outputs, seenOutputs); if (value) value->Release(); }
+        std::array<ID3D11RenderTargetView*, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT> rtvs{};
+        ID3D11DepthStencilView* dsv = nullptr;
+        context->OMGetRenderTargets(static_cast<UINT>(rtvs.size()), rtvs.data(), &dsv);
+        for (auto* value : rtvs) { add(value, outputs, seenOutputs); if (value) value->Release(); }
+        add(dsv, outputs, seenOutputs); if (dsv) dsv->Release();
+    }
+
+    CaptureJob* ObserveDraw(Kind kind, const std::array<void*, 12>& arguments) {
         drawsObserved.fetch_add(1, std::memory_order_relaxed);
-        if (!armed.load(std::memory_order_acquire) || captured.load(std::memory_order_acquire)) return;
+        if (!armed.load(std::memory_order_acquire) || capturesReserved.load(std::memory_order_acquire) >= maxCaptures) return nullptr;
         auto* context = static_cast<ID3D11DeviceContext*>(arguments[0]);
-        if (!context) return;
+        if (!context) return nullptr;
         ComPtr<ID3D11PixelShader> pixelShader;
         context->PSGetShader(&pixelShader, nullptr, nullptr);
-        std::string psSha;
-        size_t bytecodeSize = 0;
+        ComPtr<ID3D11VertexShader> vertexShader;
+        context->VSGetShader(&vertexShader, nullptr, nullptr);
+        std::string psSha, vsSha;
+        size_t bytecodeSize = 0, vertexBytecodeSize = 0;
         {
             std::lock_guard lock(mutex);
             auto found = shaders.find(pixelShader.Get());
@@ -655,12 +815,22 @@ struct Observer::Impl {
                 psSha = found->second.sha256;
                 bytecodeSize = found->second.bytecode.size();
             }
+            found = shaders.find(vertexShader.Get());
+            if (found != shaders.end()) {
+                vsSha = found->second.sha256;
+                vertexBytecodeSize = found->second.bytecode.size();
+            }
         }
-        if (!requiredPsSha256.empty() && psSha != requiredPsSha256) return;
+        if (!requiredPsSha256.empty() && psSha != requiredPsSha256) return nullptr;
+        if (!requiredVsSha256.empty() && vsSha != requiredVsSha256) return nullptr;
         matchingDraws.fetch_add(1, std::memory_order_relaxed);
-        bool expected = false;
-        if (!captured.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return;
-        Json catalog = {
+        const uint64_t captureIndex = capturesReserved.fetch_add(1, std::memory_order_acq_rel);
+        if (captureIndex >= maxCaptures) return nullptr;
+        auto job = std::make_unique<CaptureJob>();
+        job->context = context;
+        const std::string suffix = std::to_string(GetCurrentProcessId()) + "-" + std::to_string(++armCounter);
+        job->suffix = suffix;
+        job->catalog = {
             {"schema", "uc.d3d11-draw-catalog.v1"},
             {"status", "pipeline-identity-qualified-resource-snapshot-pending"},
             {"captured_utc", WallClockUtc()},
@@ -668,26 +838,53 @@ struct Observer::Impl {
             {"draw", {{"call", KindName(kind)}, {"arguments", DrawArguments(kind, arguments)}}},
             {"pixel_shader", {{"object", Pointer(pixelShader.Get())}, {"sha256", psSha},
                 {"bytecode_size", bytecodeSize}}},
+            {"vertex_shader", {{"object", Pointer(vertexShader.Get())}, {"sha256", vsSha},
+                {"bytecode_size", vertexBytecodeSize}}},
+            {"capture_index", captureIndex}, {"catalog_only", catalogOnly},
             {"startup_ledger", {{"shader_objects", shadersObserved.load()},
                 {"input_layout_objects", layoutsObserved.load()}}},
-            {"pipeline", PipelineIdentity(context)},
+            {"pipeline", PipelineIdentity(context)}, {"resource_snapshots", Json::array()},
             {"process", {{"pid", GetCurrentProcessId()}}},
         };
+        if (!catalogOnly) {
+            std::vector<ComPtr<ID3D11Resource>> inputs;
+            CollectResources(context, inputs, job->outputResources);
+            for (auto& input : inputs) job->catalog["resource_snapshots"].push_back(AddDump(*job, "before-input", input.Get()));
+            for (auto& output : job->outputResources) job->catalog["resource_snapshots"].push_back(AddDump(*job, "before-output", output.Get()));
+        }
+        return job.release();
+    }
+
+    void CompleteDraw(std::unique_ptr<CaptureJob> job) {
+        for (auto& output : job->outputResources)
+            job->catalog["resource_snapshots"].push_back(AddDump(*job, "after-output", output.Get()));
+        job->catalog["status"] = catalogOnly ? "pipeline-identity-cataloged" :
+            "pipeline-and-lossless-resource-snapshots-captured";
         std::lock_guard lock(mutex);
-        const std::string suffix = std::to_string(GetCurrentProcessId()) + "-" + std::to_string(++armCounter);
-        pendingFiles.push_back({{"relative", "draw-catalog-" + suffix + ".json"}, {"content", std::move(catalog)}});
+        for (auto& output : job->outputs) pendingOutputs.push_back(std::move(output));
+        pendingFiles.push_back({{"relative", "draw-catalog-" + job->suffix + ".json"}, {"content", std::move(job->catalog)}});
+        if (capturesReserved.load(std::memory_order_acquire) >= maxCaptures)
+            captured.store(true, std::memory_order_release);
     }
 
     void Tick() {
         if (!exportHooksReady.load(std::memory_order_acquire)) AttachExports();
         std::deque<Json> files;
+        std::deque<PendingOutput> outputs;
         {
             std::lock_guard lock(mutex);
             files.swap(pendingFiles);
+            outputs.swap(pendingOutputs);
         }
-        if (files.empty()) return;
+        if (files.empty() && outputs.empty()) return;
         Require(fs::create_directories(outputRoot) || fs::is_directory(outputRoot),
             "D3D11 observer output directory creation failed");
+        for (auto& output : outputs) {
+            const fs::path destination = outputRoot / output.relative;
+            Require(fs::create_directories(destination.parent_path()) || fs::is_directory(destination.parent_path()),
+                "D3D11 observer artifact directory creation failed");
+            NewFile(destination, output.bytes.data(), output.bytes.size());
+        }
         for (auto& file : files) {
             const fs::path destination = outputRoot / Utf8(file.at("relative").get<std::string>());
             std::string text = file.at("content").dump(2);
@@ -701,7 +898,9 @@ struct Observer::Impl {
         return {
             {"enabled", true}, {"ready", exportHooksReady.load()}, {"armed", armed.load()},
             {"captured", captured.load()}, {"arm_label", armLabel}, {"output_root", outputRoot.string()},
-            {"pixel_shader_sha256", requiredPsSha256}, {"frames_observed", frames.load()},
+            {"pixel_shader_sha256", requiredPsSha256}, {"vertex_shader_sha256", requiredVsSha256},
+            {"catalog_only", catalogOnly}, {"max_captures", maxCaptures}, {"captures_reserved", capturesReserved.load()},
+            {"frames_observed", frames.load()},
             {"draws_observed", drawsObserved.load()}, {"matching_draws", matchingDraws.load()},
             {"shaders_observed", shadersObserved.load()}, {"shader_objects_resident", shaders.size()},
             {"input_layouts_observed", layoutsObserved.load()}, {"input_layout_objects_resident", layouts.size()},
@@ -716,8 +915,10 @@ struct Observer::Impl {
         std::lock_guard lock(mutex);
         armLabel = std::move(label);
         captured.store(false, std::memory_order_release);
+        capturesReserved.store(0, std::memory_order_release);
         armed.store(true, std::memory_order_release);
         return {{"armed", true}, {"label", armLabel}, {"pixel_shader_sha256", requiredPsSha256},
+            {"vertex_shader_sha256", requiredVsSha256}, {"catalog_only", catalogOnly}, {"max_captures", maxCaptures},
             {"output_root", outputRoot.string()}};
     }
 };
