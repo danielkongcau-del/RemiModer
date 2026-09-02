@@ -1,0 +1,510 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "uc.d3d11-capture.v1",
+  "title": "UnifiedCapture lossless D3D11 replay package",
+  "type": "object",
+  "required": ["schema", "capture_id", "api", "capture_kind", "validation_mode", "source", "frame", "completeness", "artifacts", "objects", "events", "entry_event_id", "target_draw_event_ids", "checkpoints"],
+  "properties": {
+    "schema": {"const": "uc.d3d11-capture.v1"},
+    "capture_id": {"type": "string", "minLength": 1},
+    "api": {"const": "d3d11"},
+    "capture_kind": {"enum": ["authoritative_trace", "golden_replay"]},
+    "validation_mode": {"enum": ["golden", "interactive"]},
+    "source": {
+      "type": "object",
+      "required": ["capturer", "capturer_version", "captured_utc", "executable", "modules", "adapter", "feature_level"],
+      "properties": {
+        "capturer": {"type": "string", "minLength": 1},
+        "capturer_version": {"type": "string", "minLength": 1},
+        "captured_utc": {"type": "string", "format": "date-time"},
+        "executable": {"$ref": "#/$defs/hashedModule"},
+        "modules": {"type": "array", "items": {"$ref": "#/$defs/hashedModule"}},
+        "adapter": {
+          "type": "object",
+          "required": ["vendor_id", "device_id", "luid"],
+          "properties": {
+            "vendor_id": {"type": "integer", "minimum": 0},
+            "device_id": {"type": "integer", "minimum": 0},
+            "luid": {"type": "string", "pattern": "^[0-9a-f]{16}$"}
+          },
+          "additionalProperties": false
+        },
+        "feature_level": {"type": "string", "pattern": "^D3D_FEATURE_LEVEL_"}
+      },
+      "additionalProperties": false
+    },
+    "frame": {
+      "type": "object",
+      "required": ["frame_index", "width", "height"],
+      "properties": {
+        "frame_index": {"type": "integer", "minimum": 0},
+        "width": {"type": "integer", "minimum": 1},
+        "height": {"type": "integer", "minimum": 1},
+        "swapchain_format": {"$ref": "#/$defs/dxgiValue"}
+      },
+      "additionalProperties": false
+    },
+    "completeness": {
+      "type": "object",
+      "required": ["object_creation", "resource_initial_data", "resource_updates", "binding_calls", "event_order", "draw_snapshots", "lossless_artifacts"],
+      "properties": {
+        "object_creation": {"const": "complete"},
+        "resource_initial_data": {"const": "complete"},
+        "resource_updates": {"const": "complete"},
+        "binding_calls": {"const": "complete"},
+        "event_order": {"const": "complete"},
+        "draw_snapshots": {"const": "complete"},
+        "lossless_artifacts": {"const": true}
+      },
+      "additionalProperties": false
+    },
+    "artifacts": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "required": ["id", "kind", "path", "sha256", "size_bytes", "encoding", "lossless"],
+        "properties": {
+          "id": {"$ref": "#/$defs/id"},
+          "kind": {"enum": ["dxbc", "resource_initial_data", "resource_update_data", "reference_attachment", "capture_container", "metadata"]},
+          "path": {"type": "string", "minLength": 1},
+          "sha256": {"$ref": "#/$defs/sha256"},
+          "size_bytes": {"type": "integer", "minimum": 0},
+          "encoding": {"enum": ["raw", "dds", "png", "json", "rdc", "ucbin"]},
+          "lossless": {"const": true}
+        },
+        "additionalProperties": false
+      }
+    },
+    "objects": {
+      "type": "object",
+      "required": ["resources", "views", "shaders", "input_layouts", "states", "class_linkages", "class_instances", "asynchronous", "pipeline_snapshots"],
+      "properties": {
+        "resources": {"type": "array", "items": {"$ref": "#/$defs/resource"}},
+        "views": {"type": "array", "items": {"$ref": "#/$defs/view"}},
+        "shaders": {"type": "array", "items": {"$ref": "#/$defs/shader"}},
+        "input_layouts": {"type": "array", "items": {"$ref": "#/$defs/inputLayout"}},
+        "states": {"type": "array", "items": {"$ref": "#/$defs/state"}},
+        "class_linkages": {"type": "array", "items": {"$ref": "#/$defs/classLinkage"}},
+        "class_instances": {"type": "array", "items": {"$ref": "#/$defs/classInstance"}},
+        "asynchronous": {"type": "array", "items": {"$ref": "#/$defs/asynchronous"}},
+        "pipeline_snapshots": {"type": "array", "items": {"$ref": "#/$defs/pipelineSnapshot"}}
+      },
+      "additionalProperties": false
+    },
+    "events": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/event"}},
+    "entry_event_id": {"type": "integer", "minimum": 0},
+    "target_draw_event_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "integer", "minimum": 0}},
+    "checkpoints": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/checkpoint"}}
+  },
+  "additionalProperties": false,
+  "$defs": {
+    "id": {"type": "string", "pattern": "^[A-Za-z][A-Za-z0-9_.:-]*$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "hexBytes": {"type": "string", "pattern": "^(?:[0-9a-f]{2})+$"},
+    "nullableId": {"oneOf": [{"$ref": "#/$defs/id"}, {"type": "null"}]},
+    "hashedModule": {
+      "type": "object",
+      "required": ["name", "sha256"],
+      "properties": {
+        "name": {"type": "string", "minLength": 1},
+        "sha256": {"$ref": "#/$defs/sha256"}
+      },
+      "additionalProperties": false
+    },
+    "dxgiValue": {
+      "type": "object",
+      "required": ["value", "name"],
+      "properties": {
+        "value": {"type": "integer", "minimum": 0},
+        "name": {"type": "string", "pattern": "^DXGI_FORMAT_"}
+      },
+      "additionalProperties": false
+    },
+    "descriptor": {
+      "type": "object",
+      "required": ["raw_hex", "decoded"],
+      "properties": {
+        "raw_hex": {"$ref": "#/$defs/hexBytes"},
+        "decoded": {"type": "object", "minProperties": 1}
+      },
+      "additionalProperties": false
+    },
+    "initialData": {
+      "type": "object",
+      "required": ["subresource", "artifact_id"],
+      "properties": {
+        "subresource": {"type": "integer", "minimum": 0},
+        "artifact_id": {"$ref": "#/$defs/id"},
+        "row_pitch": {"type": "integer", "minimum": 0},
+        "depth_pitch": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "resource": {
+      "type": "object",
+      "required": ["id", "kind", "descriptor", "content_policy", "initial_data"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "kind": {"enum": ["buffer", "texture1d", "texture2d", "texture3d"]},
+        "descriptor": {"$ref": "#/$defs/descriptor"},
+        "content_policy": {"enum": ["undefined", "initial_data", "captured_updates"]},
+        "initial_data": {"type": "array", "items": {"$ref": "#/$defs/initialData"}}
+      },
+      "additionalProperties": false
+    },
+    "view": {
+      "type": "object",
+      "required": ["id", "kind", "resource_id", "descriptor"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "kind": {"enum": ["srv", "rtv", "dsv", "uav"]},
+        "resource_id": {"$ref": "#/$defs/id"},
+        "descriptor": {"$ref": "#/$defs/descriptor"}
+      },
+      "additionalProperties": false
+    },
+    "bindingRequirements": {
+      "type": "object",
+      "required": ["constant_buffers", "srvs", "samplers", "uavs"],
+      "properties": {
+        "constant_buffers": {"$ref": "#/$defs/slotList"},
+        "srvs": {"$ref": "#/$defs/slotList"},
+        "samplers": {"$ref": "#/$defs/slotList"},
+        "uavs": {"$ref": "#/$defs/slotList"}
+      },
+      "additionalProperties": false
+    },
+    "slotList": {"type": "array", "uniqueItems": true, "items": {"type": "integer", "minimum": 0, "maximum": 127}},
+    "shader": {
+      "type": "object",
+      "required": ["id", "stage", "artifact_id", "bytecode_sha256", "class_linkage_id", "required_bindings"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "stage": {"enum": ["vs", "ps", "gs", "hs", "ds", "cs"]},
+        "artifact_id": {"$ref": "#/$defs/id"},
+        "bytecode_sha256": {"$ref": "#/$defs/sha256"},
+        "class_linkage_id": {"$ref": "#/$defs/nullableId"},
+        "required_bindings": {"$ref": "#/$defs/bindingRequirements"}
+      },
+      "additionalProperties": false
+    },
+    "inputElement": {
+      "type": "object",
+      "required": ["semantic_name", "semantic_index", "format", "input_slot", "aligned_byte_offset", "input_slot_class", "instance_data_step_rate"],
+      "properties": {
+        "semantic_name": {"type": "string", "minLength": 1},
+        "semantic_index": {"type": "integer", "minimum": 0},
+        "format": {"$ref": "#/$defs/dxgiValue"},
+        "input_slot": {"type": "integer", "minimum": 0, "maximum": 31},
+        "aligned_byte_offset": {"type": "integer", "minimum": 0},
+        "input_slot_class": {"enum": ["per_vertex", "per_instance"]},
+        "instance_data_step_rate": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "inputLayout": {
+      "type": "object",
+      "required": ["id", "signature_artifact_id", "shader_signature_sha256", "elements"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "signature_artifact_id": {"$ref": "#/$defs/id"},
+        "shader_signature_sha256": {"$ref": "#/$defs/sha256"},
+        "elements": {"type": "array", "items": {"$ref": "#/$defs/inputElement"}}
+      },
+      "additionalProperties": false
+    },
+    "state": {
+      "type": "object",
+      "required": ["id", "kind", "descriptor"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "kind": {"enum": ["sampler", "rasterizer", "depth_stencil", "blend"]},
+        "descriptor": {"$ref": "#/$defs/descriptor"}
+      },
+      "additionalProperties": false
+    },
+    "classLinkage": {
+      "type": "object", "required": ["id"],
+      "properties": {"id": {"$ref": "#/$defs/id"}},
+      "additionalProperties": false
+    },
+    "classInstance": {
+      "type": "object", "required": ["id", "linkage_id", "descriptor"],
+      "properties": {"id": {"$ref": "#/$defs/id"}, "linkage_id": {"$ref": "#/$defs/id"}, "descriptor": {"$ref": "#/$defs/descriptor"}},
+      "additionalProperties": false
+    },
+    "asynchronous": {
+      "type": "object", "required": ["id", "kind", "descriptor"],
+      "properties": {"id": {"$ref": "#/$defs/id"}, "kind": {"enum": ["query", "predicate", "counter"]}, "descriptor": {"$ref": "#/$defs/descriptor"}},
+      "additionalProperties": false
+    },
+    "slotObject": {
+      "type": "object",
+      "required": ["slot", "object_id"],
+      "properties": {
+        "slot": {"type": "integer", "minimum": 0, "maximum": 127},
+        "object_id": {"$ref": "#/$defs/id"},
+        "first_constant": {"type": "integer", "minimum": 0},
+        "num_constants": {"type": "integer", "minimum": 0},
+        "initial_count": {"oneOf": [{"type": "integer", "minimum": 0, "maximum": 4294967295}, {"const": "keep"}]}
+      },
+      "additionalProperties": false
+    },
+    "stageBinding": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "required": ["shader_id", "class_instance_ids", "constant_buffers", "srvs", "samplers", "uavs"],
+          "properties": {
+            "shader_id": {"$ref": "#/$defs/id"},
+            "class_instance_ids": {"type": "array", "items": {"$ref": "#/$defs/id"}},
+            "constant_buffers": {"type": "array", "items": {"$ref": "#/$defs/slotObject"}},
+            "srvs": {"type": "array", "items": {"$ref": "#/$defs/slotObject"}},
+            "samplers": {"type": "array", "items": {"$ref": "#/$defs/slotObject"}},
+            "uavs": {"type": "array", "items": {"$ref": "#/$defs/slotObject"}}
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "vertexBuffer": {
+      "type": "object",
+      "required": ["slot", "resource_id", "stride", "offset"],
+      "properties": {
+        "slot": {"type": "integer", "minimum": 0, "maximum": 31},
+        "resource_id": {"$ref": "#/$defs/id"},
+        "stride": {"type": "integer", "minimum": 0},
+        "offset": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "indexBuffer": {
+      "oneOf": [
+        {"type": "null"},
+        {
+          "type": "object",
+          "required": ["resource_id", "format", "offset"],
+          "properties": {
+            "resource_id": {"$ref": "#/$defs/id"},
+            "format": {"enum": ["DXGI_FORMAT_R16_UINT", "DXGI_FORMAT_R32_UINT"]},
+            "offset": {"type": "integer", "minimum": 0}
+          },
+          "additionalProperties": false
+        }
+      ]
+    },
+    "viewport": {
+      "type": "object",
+      "required": ["top_left_x", "top_left_y", "width", "height", "min_depth", "max_depth"],
+      "properties": {
+        "top_left_x": {"type": "number"}, "top_left_y": {"type": "number"},
+        "width": {"type": "number", "exclusiveMinimum": 0}, "height": {"type": "number", "exclusiveMinimum": 0},
+        "min_depth": {"type": "number"}, "max_depth": {"type": "number"}
+      },
+      "additionalProperties": false
+    },
+    "rect": {
+      "type": "object",
+      "required": ["left", "top", "right", "bottom"],
+      "properties": {"left": {"type": "integer"}, "top": {"type": "integer"}, "right": {"type": "integer"}, "bottom": {"type": "integer"}},
+      "additionalProperties": false
+    },
+    "pipelineSnapshot": {
+      "type": "object",
+      "required": ["id", "event_id", "binding_event_ids", "input_assembler", "stages", "stream_output", "rasterizer", "output_merger", "predication"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"},
+        "event_id": {"type": "integer", "minimum": 0},
+        "binding_event_ids": {"type": "array", "minItems": 1, "uniqueItems": true, "items": {"type": "integer", "minimum": 0}},
+        "input_assembler": {
+          "type": "object",
+          "required": ["input_layout_id", "primitive_topology", "vertex_buffers", "index_buffer"],
+          "properties": {
+            "input_layout_id": {"$ref": "#/$defs/nullableId"},
+            "primitive_topology": {"type": "string", "pattern": "^D3D11_PRIMITIVE_TOPOLOGY_"},
+            "vertex_buffers": {"type": "array", "items": {"$ref": "#/$defs/vertexBuffer"}},
+            "index_buffer": {"$ref": "#/$defs/indexBuffer"}
+          },
+          "additionalProperties": false
+        },
+        "stages": {
+          "type": "object",
+          "required": ["vs", "ps", "gs", "hs", "ds", "cs"],
+          "properties": {
+            "vs": {"$ref": "#/$defs/stageBinding"}, "ps": {"$ref": "#/$defs/stageBinding"},
+            "gs": {"$ref": "#/$defs/stageBinding"}, "hs": {"$ref": "#/$defs/stageBinding"},
+            "ds": {"$ref": "#/$defs/stageBinding"}, "cs": {"$ref": "#/$defs/stageBinding"}
+          },
+          "additionalProperties": false
+        },
+        "stream_output": {
+          "type": "object", "required": ["targets"],
+          "properties": {"targets": {"type": "array", "items": {"$ref": "#/$defs/slotObject"}}},
+          "additionalProperties": false
+        },
+        "rasterizer": {
+          "type": "object", "required": ["state_id", "viewports", "scissors"],
+          "properties": {
+            "state_id": {"$ref": "#/$defs/nullableId"},
+            "viewports": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/viewport"}},
+            "scissors": {"type": "array", "items": {"$ref": "#/$defs/rect"}}
+          },
+          "additionalProperties": false
+        },
+        "output_merger": {
+          "type": "object",
+          "required": ["rtvs", "dsv_id", "uavs", "blend_state_id", "blend_factor", "sample_mask", "depth_stencil_state_id", "stencil_ref"],
+          "properties": {
+            "rtvs": {"type": "array", "maxItems": 8, "items": {"$ref": "#/$defs/slotObject"}},
+            "dsv_id": {"$ref": "#/$defs/nullableId"},
+            "uavs": {"type": "array", "items": {"$ref": "#/$defs/slotObject"}},
+            "blend_state_id": {"$ref": "#/$defs/nullableId"},
+            "blend_factor": {"type": "array", "minItems": 4, "maxItems": 4, "items": {"type": "number"}},
+            "sample_mask": {"type": "integer", "minimum": 0, "maximum": 4294967295},
+            "depth_stencil_state_id": {"$ref": "#/$defs/nullableId"},
+            "stencil_ref": {"type": "integer", "minimum": 0, "maximum": 255}
+          },
+          "additionalProperties": false
+        },
+        "predication": {
+          "type": "object", "required": ["predicate_id", "value"],
+          "properties": {"predicate_id": {"$ref": "#/$defs/nullableId"}, "value": {"type": "boolean"}},
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "box": {
+      "type": "object", "required": ["left", "top", "front", "right", "bottom", "back"],
+      "properties": {"left": {"type": "integer", "minimum": 0}, "top": {"type": "integer", "minimum": 0}, "front": {"type": "integer", "minimum": 0}, "right": {"type": "integer", "minimum": 0}, "bottom": {"type": "integer", "minimum": 0}, "back": {"type": "integer", "minimum": 0}},
+      "additionalProperties": false
+    },
+    "event": {
+      "oneOf": [
+        {"$ref": "#/$defs/createEvent"}, {"$ref": "#/$defs/destroyEvent"},
+        {"$ref": "#/$defs/updateEvent"}, {"$ref": "#/$defs/setEvent"},
+        {"$ref": "#/$defs/asyncEvent"},
+        {"$ref": "#/$defs/drawEvent"}, {"$ref": "#/$defs/dispatchEvent"},
+        {"$ref": "#/$defs/copyEvent"}, {"$ref": "#/$defs/clearEvent"},
+        {"$ref": "#/$defs/mipsEvent"}, {"$ref": "#/$defs/presentEvent"}, {"$ref": "#/$defs/markerEvent"}
+      ]
+    },
+    "eventBase": {
+      "type": "object",
+      "required": ["id", "op"],
+      "properties": {"id": {"type": "integer", "minimum": 0}, "op": {"type": "string"}}
+    },
+    "createEvent": {
+      "type": "object", "required": ["id", "op", "object_id", "call"],
+      "properties": {"id": {"type": "integer", "minimum": 0}, "op": {"const": "create_object"}, "object_id": {"$ref": "#/$defs/id"}, "call": {"type": "string", "pattern": "^(Create|GetClassInstance$)"}},
+      "additionalProperties": false
+    },
+    "destroyEvent": {
+      "type": "object", "required": ["id", "op", "object_id"],
+      "properties": {"id": {"type": "integer", "minimum": 0}, "op": {"const": "destroy_object"}, "object_id": {"$ref": "#/$defs/id"}},
+      "additionalProperties": false
+    },
+    "updateEvent": {
+      "type": "object", "required": ["id", "op", "resource_id", "artifact_id", "subresource", "row_pitch", "depth_pitch"],
+      "properties": {
+        "id": {"type": "integer", "minimum": 0}, "op": {"enum": ["update_buffer", "update_texture", "map_write"]},
+        "resource_id": {"$ref": "#/$defs/id"}, "artifact_id": {"$ref": "#/$defs/id"},
+        "subresource": {"type": "integer", "minimum": 0}, "box": {"$ref": "#/$defs/box"},
+        "row_pitch": {"type": "integer", "minimum": 0}, "depth_pitch": {"type": "integer", "minimum": 0}
+      },
+      "additionalProperties": false
+    },
+    "setEvent": {
+      "type": "object", "required": ["id", "op", "call", "arguments", "object_ids"],
+      "properties": {
+        "id": {"type": "integer", "minimum": 0}, "op": {"const": "set_state"},
+        "call": {"type": "string", "pattern": "^(IA|VS|PS|GS|HS|DS|CS|RS|OM|SO|SetPredication)"},
+        "arguments": {"type": "object"},
+        "object_ids": {"type": "array", "items": {"$ref": "#/$defs/id"}}
+      },
+      "additionalProperties": false
+    },
+    "asyncEvent": {
+      "type": "object", "required": ["id", "op", "call", "async_id"],
+      "properties": {
+        "id": {"type": "integer", "minimum": 0}, "op": {"const": "async"},
+        "call": {"enum": ["Begin", "End", "GetData"]}, "async_id": {"$ref": "#/$defs/id"},
+        "artifact_id": {"$ref": "#/$defs/id"}, "arguments": {"type": "object"}
+      },
+      "additionalProperties": false
+    },
+    "drawEvent": {
+      "type": "object", "required": ["id", "op", "call", "arguments", "snapshot_id"],
+      "properties": {
+        "id": {"type": "integer", "minimum": 0}, "op": {"const": "draw"},
+        "call": {"enum": ["Draw", "DrawIndexed", "DrawInstanced", "DrawIndexedInstanced", "DrawAuto", "DrawInstancedIndirect", "DrawIndexedInstancedIndirect"]},
+        "arguments": {"type": "object"}, "snapshot_id": {"$ref": "#/$defs/id"},
+        "indirect_args_resource_id": {"$ref": "#/$defs/id"}
+      },
+      "additionalProperties": false
+    },
+    "dispatchEvent": {
+      "type": "object", "required": ["id", "op", "call", "arguments", "snapshot_id"],
+      "properties": {
+        "id": {"type": "integer", "minimum": 0}, "op": {"const": "dispatch"},
+        "call": {"enum": ["Dispatch", "DispatchIndirect"]}, "arguments": {"type": "object"},
+        "snapshot_id": {"$ref": "#/$defs/id"}, "indirect_args_resource_id": {"$ref": "#/$defs/id"}
+      },
+      "additionalProperties": false
+    },
+    "copyEvent": {
+      "type": "object", "required": ["id", "op", "src_resource_id", "dst_resource_id", "arguments"],
+      "properties": {
+        "id": {"type": "integer", "minimum": 0}, "op": {"enum": ["copy_resource", "copy_subresource_region", "resolve_subresource"]},
+        "src_resource_id": {"$ref": "#/$defs/id"}, "dst_resource_id": {"$ref": "#/$defs/id"}, "arguments": {"type": "object"}
+      },
+      "additionalProperties": false
+    },
+    "clearEvent": {
+      "type": "object", "required": ["id", "op", "view_id", "value"],
+      "properties": {"id": {"type": "integer", "minimum": 0}, "op": {"enum": ["clear_rtv", "clear_dsv", "clear_uav"]}, "view_id": {"$ref": "#/$defs/id"}, "value": {}},
+      "additionalProperties": false
+    },
+    "mipsEvent": {
+      "type": "object", "required": ["id", "op", "view_id"],
+      "properties": {"id": {"type": "integer", "minimum": 0}, "op": {"const": "generate_mips"}, "view_id": {"$ref": "#/$defs/id"}},
+      "additionalProperties": false
+    },
+    "presentEvent": {
+      "type": "object", "required": ["id", "op", "sync_interval", "flags"],
+      "properties": {"id": {"type": "integer", "minimum": 0}, "op": {"const": "present"}, "sync_interval": {"type": "integer", "minimum": 0}, "flags": {"type": "integer", "minimum": 0}},
+      "additionalProperties": false
+    },
+    "markerEvent": {
+      "type": "object", "required": ["id", "op", "label"],
+      "properties": {"id": {"type": "integer", "minimum": 0}, "op": {"const": "marker"}, "label": {"type": "string", "minLength": 1}},
+      "additionalProperties": false
+    },
+    "attachment": {
+      "type": "object", "required": ["resource_id", "subresource", "aspect", "artifact_id", "row_pitch", "depth_pitch", "comparison"],
+      "properties": {
+        "resource_id": {"$ref": "#/$defs/id"}, "subresource": {"type": "integer", "minimum": 0},
+        "view_id": {"$ref": "#/$defs/id"}, "aspect": {"enum": ["color", "depth", "stencil", "buffer"]},
+        "artifact_id": {"$ref": "#/$defs/id"},
+        "row_pitch": {"type": "integer", "minimum": 0}, "depth_pitch": {"type": "integer", "minimum": 0},
+        "comparison": {
+          "type": "object", "required": ["mode"],
+          "properties": {"mode": {"enum": ["exact_bytes", "exact_unorm", "exact_uint", "float_tolerance", "depth_stencil"]}, "absolute_tolerance": {"type": "number", "minimum": 0}, "relative_tolerance": {"type": "number", "minimum": 0}},
+          "additionalProperties": false
+        }
+      },
+      "additionalProperties": false
+    },
+    "checkpoint": {
+      "type": "object", "required": ["id", "phase", "event_id", "attachments"],
+      "properties": {
+        "id": {"$ref": "#/$defs/id"}, "phase": {"enum": ["before_event", "after_event"]},
+        "event_id": {"type": "integer", "minimum": 0},
+        "attachments": {"type": "array", "minItems": 1, "items": {"$ref": "#/$defs/attachment"}}
+      },
+      "additionalProperties": false
+    }
+  }
+}

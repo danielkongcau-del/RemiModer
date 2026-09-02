@@ -11,6 +11,8 @@ if not defined VCToolsInstallDir (
 cd /d "%~dp0"
 if not exist build mkdir build
 set "UC_INC=/Ivendor /Ivendor\gum-17.17.0 /Inative"
+set "UC_RENDERDOC_INC="
+if exist "%ProgramFiles%\RenderDoc\renderdoc_app.h" set UC_RENDERDOC_INC=/I"%ProgramFiles%\RenderDoc"
 set "UC_COMMON=native\common.cpp native\modules.cpp"
 ml64 /nologo /c /Fo build\pair_runtime_fixture.obj native\pair_runtime_fixture.asm
 if errorlevel 1 exit /b 1
@@ -27,4 +29,6 @@ if errorlevel 1 exit /b 1
 cl /nologo /std:c++20 /utf-8 /O2 /W4 /MT /EHsc /Inative native\pairing_probe.cpp /Fo:build\ /Fe:build\PairLedgerProbe.exe /link /INCREMENTAL:NO
 if errorlevel 1 exit /b 1
 cl /nologo /std:c++20 /utf-8 /O2 /W4 /MT /EHsc /Ivendor /Inative native\store_probe.cpp %UC_COMMON% native\store.cpp /Fo:build\ /Fe:build\StoreProbe.exe /link /INCREMENTAL:NO Bcrypt.lib Cabinet.lib Psapi.lib
+if errorlevel 1 exit /b 1
+cl /nologo /std:c++20 /utf-8 /O2 /W4 /MT /EHsc /Ivendor /Inative %UC_RENDERDOC_INC% native\d3d11_capture_fixture.cpp native\d3d11_package.cpp native\common.cpp native\modules.cpp /Fo:build\ /Fe:build\D3D11CaptureFixture.exe /link /INCREMENTAL:NO Bcrypt.lib Psapi.lib D3D11.lib DXGI.lib D3DCompiler.lib User32.lib
 exit /b %errorlevel%

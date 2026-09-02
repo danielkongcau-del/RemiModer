@@ -6,6 +6,8 @@ UnifiedCapture is a configurable local evidence recorder for Windows x64 process
 
 - `native/` implements the C++20 recorder and owned-fixture executables.
 - `uc/` implements schemas, validation, storage verification, indexing, projections, and mechanical callsite analysis.
+- `schemas/d3d11-capture-v1.schema.json` and `uc/d3d11_capture.py` define the lossless D3D11 object/event package used to gate native golden replay. The validator closes descriptor, artifact, object-lifetime, resource-initialization, shader-slot, pipeline-snapshot, and checkpoint references before replay work begins.
+- `renderdoc_export_inventory.py` converts an RDC through RenderDoc's own XML+ZIP exporter and mechanically verifies every referenced binary member before any claim of package completeness.
 - `capturectl.py` provides the local control interface.
 - `d0ctl.py` and `entryctl.py` provide resumable single-entry and multi-entry orchestration.
 - `campaignctl.py` qualifies the union of several entry plans once, then switches their immutable generations in one target process with explicit armed/complete marks.
